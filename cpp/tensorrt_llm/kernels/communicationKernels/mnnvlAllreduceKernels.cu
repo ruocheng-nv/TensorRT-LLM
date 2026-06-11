@@ -347,7 +347,12 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
     reinterpret_cast<PackedType*>(&stagePtrMcast[token * tokenDim * WorldSize + rank * tokenDim])[packedIdx]
         = val.packed;
 
-    flag.ctaArrive();
+    // NOTE: ctaArrive() is intentionally deferred until after the Lamport buffer reads
+    // (poll + reduction) complete. The arrival counter gates waitAndUpdate's flag
+    // rotation, which marks the current buffer as reusable ("dirty"). Arriving here
+    // (before the reads) let a subsequent allreduce clear this buffer while peer CTAs
+    // were still reading it under PDL overlap, corrupting the reduction (NaN).
+    // See NVBug 6215663 / 6195766.
     // ======================= Lamport Sync and clear the output buffer from previous iteration
     // =============================
     flag.clearDirtyLamportBuf(inputPtrs[rank], -1);
@@ -400,6 +405,11 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
     {
         packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
     }
+    // Signal arrival only after every CTA has finished reading the Lamport buffer
+    // (poll loop + reduction above). This makes waitAndUpdate's flag rotation - which
+    // marks the buffer reusable - happen strictly after all reads, closing the
+    // clear-vs-read race exposed by PDL overlap. See NVBug 6215663 / 6195766.
+    flag.ctaArrive();
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -668,9 +678,6 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
     // Optionally wait for results if the next layer isn't doing the Lamport check
     if (wait_for_results)
     {
-        // Update the atomic counter to indicate the block has read the offsets
-        flag.ctaArrive();
-
         PackedVec<PackedType, float> valLamport;
         valLamport.packed = loadPackedVolatile<PackedType>(&broadcastBufR[threadOffset]);
         while (isNegZero(valLamport.elements[0]))
@@ -681,6 +688,11 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
         {
             reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = valLamport.packed;
         }
+
+        // Signal arrival only after the broadcast buffer read-back completes, so
+        // waitAndUpdate's flag rotation cannot mark the buffer reusable while peer
+        // CTAs are still reading it under PDL overlap. See NVBug 6215663 / 6195766.
+        flag.ctaArrive();
 
         // Update the buffer flags
         flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(numTokens, WorldSize) * WorldSize * tokenDim
