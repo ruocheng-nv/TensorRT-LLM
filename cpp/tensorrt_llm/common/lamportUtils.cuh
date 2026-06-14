@@ -229,20 +229,21 @@ public:
         }
     }
 
-    __device__ void waitAndUpdate(uint4 bytesToClearPerStage)
+    // Returns true for the single thread that rotates the Lamport flags.
+    __device__ bool waitAndUpdate(uint4 bytesToClearPerStage)
     {
-        bool isLastCtaT0{false};
+        bool isUpdateThread{false};
         int targetCount{0};
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cg::grid_group grid = cg::this_grid();
         // Use the first thread instead of the last thread as the last thread may exit early
-        isLastCtaT0 = grid.thread_rank() == 0;
+        isUpdateThread = grid.thread_rank() == 0;
         targetCount = grid.num_clusters();
 #else
-        isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0;
+        isUpdateThread = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0;
         targetCount = gridDim.x * gridDim.y;
 #endif
-        if (isLastCtaT0)
+        if (isUpdateThread)
         {
             uint4* flagPtr = reinterpret_cast<uint4*>(mBufferFlagsPtr);
             while (*reinterpret_cast<uint32_t volatile*>(mFlagAccessPtr) < targetCount)
@@ -256,6 +257,7 @@ public:
             flagPtr[1] = bytesToClearPerStage;
             *mFlagAccessPtr = 0;
         }
+        return isUpdateThread;
     }
 
 private:

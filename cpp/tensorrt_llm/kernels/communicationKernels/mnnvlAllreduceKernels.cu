@@ -347,7 +347,7 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
     reinterpret_cast<PackedType*>(&stagePtrMcast[token * tokenDim * WorldSize + rank * tokenDim])[packedIdx]
         = val.packed;
 
-    flag.ctaArrive();
+    // Defer CTA arrival until this CTA finishes reading Lamport buffers and writing output.
     // ======================= Lamport Sync and clear the output buffer from previous iteration
     // =============================
     flag.clearDirtyLamportBuf(inputPtrs[rank], -1);
@@ -400,9 +400,6 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
     {
         packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     if constexpr (RMSNormFusion)
     {
         // =============================== Residual ===============================
@@ -455,7 +452,17 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(T* outputPt
         }
     }
     reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = packedAccum.packed;
-    flag.waitAndUpdate({static_cast<uint32_t>(numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
+
+    // The updater thread rotates flags before releasing PDL-dependent kernels that may consume outputPtr.
+    flag.ctaArrive();
+    bool const updateDone
+        = flag.waitAndUpdate({static_cast<uint32_t>(numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (updateDone)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 using detail::adjustGridConfig;
@@ -580,7 +587,10 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
     T* broadcastBufR = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], MNNVLTwoShotStage::BROADCAST));
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
+    if (!wait_for_results)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
     // Make sure the clear function is called before OOB thread exits
     if (packedIdx * kELTS_PER_THREAD >= tokenDim)
@@ -668,9 +678,6 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
     // Optionally wait for results if the next layer isn't doing the Lamport check
     if (wait_for_results)
     {
-        // Update the atomic counter to indicate the block has read the offsets
-        flag.ctaArrive();
-
         PackedVec<PackedType, float> valLamport;
         valLamport.packed = loadPackedVolatile<PackedType>(&broadcastBufR[threadOffset]);
         while (isNegZero(valLamport.elements[0]))
@@ -682,11 +689,21 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(T* outputPtr, T co
             reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = valLamport.packed;
         }
 
+        // Signal arrival only after this CTA has read the broadcast buffer.
+        flag.ctaArrive();
+
         // Update the buffer flags
-        flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(numTokens, WorldSize) * WorldSize * tokenDim
-                                * kELT_SIZE),                        // Clear Size for scatter stage
+        bool const updateDone
+            = flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(numTokens, WorldSize) * WorldSize * tokenDim
+                                      * kELT_SIZE),                        // Clear Size for scatter stage
             static_cast<uint32_t>(numTokens * tokenDim * kELT_SIZE), // Clear Size for broadcast stage
             0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        if (updateDone)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+#endif
         // If not wait for results, we will rely on the following kernel to update the buffer
     }
 }
@@ -704,6 +721,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 {
     static_assert(std::is_same_v<T_IN, T_OUT>, "T_IN and T_OUT must be the same type");
     static int const kELTS_PER_LOAD = sizeof(float4) / sizeof(T_IN);
+    static int const kLAMPORT_ELTS_PER_LOAD = sizeof(float4) / sizeof(float);
 
     uint32_t const token = blockIdx.x;
     uint32_t const blockSize = blockDim.x;
@@ -736,9 +754,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
     T_IN* input = reinterpret_cast<T_IN*>(
         flag.getCurLamportBuf(reinterpret_cast<void*>(bufferInput), MNNVLTwoShotStage::BROADCAST));
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     // The offset that current thread should load from. Note that the hidden dimension is split by CGA size and each
     // block loads a contiguous chunk;
     // The size of chunk that each block processes
@@ -774,7 +789,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
     }
     __pipeline_commit();
 
-    flag.ctaArrive();
     bool valid = false;
     // ACQBLK if not lamport
     while (!valid)
@@ -791,16 +805,23 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
                 float4* dst4 = reinterpret_cast<float4*>(&smemInput[threadLoadOffset]);
                 float4 const* src4 = reinterpret_cast<float4 const*>(&input[offsets[i]]);
 
-                float4 value = loadPackedVolatile<float4>(src4);
-                // Assume that the 16B were written atomically, so we only need to check one value
-                valid &= !isNegZero(value.x);
-                *dst4 = value;
+                PackedVec<float4, float> value;
+                value.packed = loadPackedVolatile<float4>(src4);
+#pragma unroll
+                for (int j = 0; j < kLAMPORT_ELTS_PER_LOAD; j++)
+                {
+                    valid &= !isNegZero(value.elements[j]);
+                }
+                *dst4 = value.packed;
             }
         }
     }
 
     __pipeline_wait_prior(1);
     __syncthreads();
+
+    // The Lamport buffer is no longer accessed after all CTAs have copied it into shared memory.
+    flag.ctaArrive();
 
     float threadSum = 0.f;
 #pragma unroll
@@ -880,8 +901,16 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 #endif
 
     // Update the buffer pointers
-    flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(numTokens, worldSize) * worldSize * dim * kELTS_SIZE),
-        static_cast<uint32_t>(numTokens * dim * kELTS_SIZE), 0, 0});
+    // The updater thread releases PDL-dependent kernels only after flags are rotated and outputs are written.
+    bool const updateDone = flag.waitAndUpdate(
+        {static_cast<uint32_t>(divUp<uint32_t>(numTokens, worldSize) * worldSize * dim * kELTS_SIZE),
+            static_cast<uint32_t>(numTokens * dim * kELTS_SIZE), 0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (updateDone)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
