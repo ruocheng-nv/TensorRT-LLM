@@ -614,13 +614,14 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
             = val.packed;
     }
 
-    flag.ctaArrive();
     // ======================= Lamport Sync and clear the output buffer from previous iteration
     // =============================
     flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
 
     if (!inBounds)
     {
+        // OOB CTAs still participate in Lamport arrival so waitAndUpdate can observe the full grid.
+        flag.ctaArrive();
         return;
     }
 
@@ -669,9 +670,6 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
             packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
         }
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     if constexpr (ar_fusion::HasResidual<Pattern>)
     {
         // =============================== Residual ===============================
@@ -732,7 +730,15 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     int const packedAccessIdx = threadOffset / kELTS_PER_THREAD;
     writeEpilogueOutput<Pattern, T, PackedType, kELTS_PER_THREAD>(
         packedAccum, params, threadOffset, packedAccessIdx, packedIdx, token);
-    flag.waitAndUpdate({static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
+    flag.ctaArrive();
+    bool const updateDone = flag.waitAndUpdate(
+        {static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (updateDone)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 using detail::adjustGridConfig;
@@ -915,7 +921,10 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
+    if (!params.waitForResults)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
 
     flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER);
@@ -948,9 +957,6 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
     // Optionally wait for results if the next layer isn't doing the Lamport check
     if (params.waitForResults)
     {
-        // Update the atomic counter to indicate the block has read the offsets
-        flag.ctaArrive();
-
         if (inBounds)
         {
             auto loaded = loadPackedVolatile<PackedType>(&broadcastBufR[threadOffset]);
@@ -964,11 +970,21 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
             }
         }
 
+        // Signal arrival only after this CTA has read the broadcast buffer.
+        flag.ctaArrive();
+
         // Update the buffer flags
-        flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(params.numTokens, WorldSize) * WorldSize
-                                * params.tokenDim * kELT_SIZE),                    // Clear Size for scatter stage
-            static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), // Clear Size for broadcast stage
-            0, 0});
+        bool const updateDone
+            = flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(params.numTokens, WorldSize) * WorldSize
+                                      * params.tokenDim * kELT_SIZE),                    // Clear Size for scatter stage
+                static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), // Clear Size for broadcast stage
+                0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        if (updateDone)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+#endif
         // If not wait for results, we will rely on the following kernel to update the buffer
     }
 }
@@ -1019,9 +1035,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
     T* input = reinterpret_cast<T*>(
         flag.getCurLamportBuf(reinterpret_cast<void*>(params.bufferInputPtr), MNNVLTwoShotStage::BROADCAST));
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     // The offset that current thread should load from. Note that the hidden dimension is split by CGA size and each
     // block loads a contiguous chunk;
     // The size of chunk that each block processes
@@ -1061,7 +1074,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
     }
     __pipeline_commit();
 
-    flag.ctaArrive();
     bool valid = false;
     // ACQBLK if not lamport
     while (!valid)
@@ -1181,10 +1193,20 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
     cudaGridDependencySynchronize();
 #endif
 
+    // Signal arrival only after this CTA has read the Lamport buffer and written its output.
+    flag.ctaArrive();
+
     // Update the buffer pointers
-    flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(params.numTokens, params.nRanks) * params.nRanks
-                            * params.tokenDim * kELTS_SIZE),
-        static_cast<uint32_t>(params.numTokens * params.tokenDim * kELTS_SIZE), 0, 0});
+    bool const updateDone
+        = flag.waitAndUpdate({static_cast<uint32_t>(divUp<uint32_t>(params.numTokens, params.nRanks) * params.nRanks
+                                  * params.tokenDim * kELTS_SIZE),
+            static_cast<uint32_t>(params.numTokens * params.tokenDim * kELTS_SIZE), 0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (updateDone)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)

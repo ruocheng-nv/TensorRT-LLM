@@ -294,7 +294,8 @@ public:
         }
     }
 
-    __device__ void waitAndUpdate(uint4 bytesToClearPerStage)
+    // Returns true for the single thread that rotates the Lamport flags.
+    __device__ bool waitAndUpdate(uint4 bytesToClearPerStage)
     {
         bool isLastCtaT0{false};
         int targetCount{0};
@@ -340,6 +341,7 @@ public:
             flagPtr[1] = bytesToClearPerStage;
             *mFlagAccessPtr = 0;
         }
+        return isLastCtaT0;
     }
 
 private:
