@@ -57,6 +57,30 @@ References:
 Every exit path writes the JSON summary and ``<summary>.exit.txt``. Compact
 per-step metrics (not full logits) are saved to ``--metrics-out`` (.pt).
 
+Stage-5 C5 additions: ``--ep`` selects expert parallelism for the MoE
+(``--tp 4 --ep 4`` = TP4/EP4, mirroring the serve driver's Mapping
+resolution), and ``--cross-geometry-ref``/``--cross-geometry-metrics``
+compare this run's greedy token trajectories against a sealed replay of a
+DIFFERENT geometry (TP4 vs the accepted Stage-4 PP=4 run), retaining the
+first-fork tokens/logits/margins in ``cross_geometry``. Structural
+mismatches (reference not ok, missing rows/metrics, length mismatch) are
+hard failures in every mode.
+
+Stage-6 addition: ``--cross-geometry-gate`` selects how token forks gate the
+run (acceptance Stage-6 C1 / plan.md Decision G):
+
+- ``exact`` (default; the Stage-5 C5 contract): ANY fork FAILS the run.
+- ``qualified-tp4-pp4``: the replan-authorized bounded classifier for the
+  TP4-vs-PP4 comparison ONLY. Every fork is classified ``qualified_near_tie``
+  or ``failed`` against the hard-coded ``DECISION_G_QUALIFIED_FORKS`` table
+  (the two sealed iteration-55 near-ties); a ``failed`` fork appends a
+  problem. There is deliberately NO generic tolerance: any new location,
+  changed candidate pair, candidate logit outside [16,32), separation >0.5
+  on either side, or absent/non-finite logit is unqualified and fails.
+- ``diagnostic``: forks are fully reported but never problems — the
+  Stage-6 C1 scope for TP4/EP4-vs-PP4, which "are fully reported but are
+  not a cross-geometry equality or qualification gate".
+
 Run (B config, all eight GPUs free):
     python tests/unittest/_torch/modeling/glm5_next_llm_api_logit_replay.py \
         --pp 8 --config B \
@@ -69,6 +93,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -531,7 +556,315 @@ def compare_with_baseline(b_summary_path, b_metrics_path, summary, per_step_stor
     return evidence, problems
 
 
-def main() -> int:
+def resolve_moe_parallel(tp: int, pp: int, ep):
+    """Mirror the serve driver's Mapping resolution for summary + LLM kwargs.
+
+    ``--tp 4`` -> moe_tp=4, moe_ep=1 (label ``TP4``); ``--tp 4 --ep 4`` ->
+    moe_tp=1, moe_ep=4 (label ``TP4/EP4``) — matching tensorrt_llm/mapping.py
+    and glm5_next_trtllm_serve_smoke.py: with ``--ep`` the world's ranks split
+    experts (moe_tp=world//ep, moe_ep=ep); without it the MoE is
+    tensor-parallel (moe_tp=tp, moe_ep=1). Returns
+    (moe_tp, moe_ep, mapping_label, llm_extra_kwargs); the kwargs carry
+    ``moe_expert_parallel_size`` only when ``--ep`` was given, so the TP-only
+    path stays byte-identical to the pre-EP driver behavior.
+    """
+    world = tp * pp
+    if ep is not None:
+        if world % ep != 0:
+            raise ValueError(f"world_size {world} not divisible by --ep {ep}")
+        moe_tp, moe_ep = world // ep, ep
+    else:
+        moe_tp, moe_ep = tp, 1
+    label = f"TP{tp}/EP{ep}" if ep is not None else f"TP{tp}"
+    if pp > 1:
+        label += f"/PP{pp}"
+    llm_kwargs = {"moe_expert_parallel_size": ep} if ep is not None else {}
+    return moe_tp, moe_ep, label, llm_kwargs
+
+
+# Decision G (plan.md Stage 6 / acceptance Stage-6 C1): the ONLY TP4-vs-PP4
+# fork locations that may ever be qualified, with the sealed candidate pair at
+# each — canary0 step 35 (PP4 token 11 vs TP4 token 53059) and short9 step 8
+# (PP4 token 13 vs TP4 token 11), exactly as recorded bitwise-identically in
+# the iteration-55 sealed B and E runs. Hard-coded on purpose: the classifier
+# must not expose a generic token or logit tolerance, so any other location,
+# pair, or count fails regardless of margin.
+DECISION_G_QUALIFIED_FORKS = (
+    {"row": "canary0", "step": 35, "ref_token": 11, "cur_token": 53059},
+    {"row": "short9", "step": 8, "ref_token": 13, "cur_token": 11},
+)
+# All four candidate logits must be finite with |logit| in [16, 32) — the BF16
+# band where one ULP is 0.125, making 0.5 at most four ULP of separation.
+DECISION_G_LOGIT_ABS_BAND = (16.0, 32.0)
+# Candidate separation must be <=0.5 on the reference (PP4) side AND
+# independently <=0.5 on the current (TP4) side.
+DECISION_G_MAX_SEPARATION = 0.5
+
+CROSS_GEOMETRY_GATE_MODES = ("exact", "qualified-tp4-pp4", "diagnostic")
+
+
+def classify_fork_decision_g(row_name, fork):
+    """Classify one cross-geometry fork under Decision G (fail-closed).
+
+    Returns ``(classification, qualification)`` where classification is
+    ``"qualified_near_tie"`` or ``"failed"`` and qualification records every
+    checked condition. A fork qualifies ONLY when all of the following hold;
+    each violated condition is named in ``failed_conditions``:
+
+    - (row, step) is one of the two sealed ``DECISION_G_QUALIFIED_FORKS``
+      locations and the (ref_token, cur_token) pair matches that entry;
+    - all four candidate logits (each side's logit for both candidate tokens)
+      are present and finite with absolute value in [16, 32) — an absent
+      (None) or non-finite logit is unqualified by construction (fail-closed
+      on absent/non-finite evidence);
+    - the two candidates' absolute separation is <=0.5 on the reference side
+      and independently <=0.5 on the current side.
+    """
+    failed = []
+    allowed = next(
+        (
+            a
+            for a in DECISION_G_QUALIFIED_FORKS
+            if a["row"] == row_name and a["step"] == fork["step"]
+        ),
+        None,
+    )
+    if allowed is None:
+        failed.append(
+            f"location {row_name}@step{fork['step']} is not one of the two sealed "
+            f"Decision-G fork locations"
+        )
+    elif fork["ref_token"] != allowed["ref_token"] or fork["cur_token"] != allowed["cur_token"]:
+        failed.append(
+            f"candidate pair (ref {fork['ref_token']}, cur {fork['cur_token']}) differs "
+            f"from the sealed pair (ref {allowed['ref_token']}, cur {allowed['cur_token']})"
+        )
+    logits = {
+        "ref_logit_at_ref_token": fork["ref_logit_at_ref_token"],
+        "ref_logit_at_cur_token": fork["ref_logit_at_cur_token"],
+        "cur_logit_at_ref_token": fork["cur_logit_at_ref_token"],
+        "cur_logit_at_cur_token": fork["cur_logit_at_cur_token"],
+    }
+    ref_sep = cur_sep = None
+    absent = [k for k, v in logits.items() if v is None or not math.isfinite(float(v))]
+    if absent:
+        failed.append(
+            "candidate logits absent or non-finite (fail-closed): " + ", ".join(sorted(absent))
+        )
+    else:
+        lo, hi = DECISION_G_LOGIT_ABS_BAND
+        out_of_band = {k: v for k, v in logits.items() if not lo <= abs(float(v)) < hi}
+        if out_of_band:
+            failed.append(
+                f"candidate logit magnitude outside [{lo},{hi}): "
+                + ", ".join(f"{k}={v}" for k, v in sorted(out_of_band.items()))
+            )
+        ref_sep = abs(
+            float(logits["ref_logit_at_ref_token"]) - float(logits["ref_logit_at_cur_token"])
+        )
+        cur_sep = abs(
+            float(logits["cur_logit_at_cur_token"]) - float(logits["cur_logit_at_ref_token"])
+        )
+        if ref_sep > DECISION_G_MAX_SEPARATION:
+            failed.append(
+                f"reference-side candidate separation {ref_sep} > {DECISION_G_MAX_SEPARATION}"
+            )
+        if cur_sep > DECISION_G_MAX_SEPARATION:
+            failed.append(
+                f"current-side candidate separation {cur_sep} > {DECISION_G_MAX_SEPARATION}"
+            )
+    qualification = {
+        "allowed_location": allowed,
+        "logit_abs_band": list(DECISION_G_LOGIT_ABS_BAND),
+        "max_separation": DECISION_G_MAX_SEPARATION,
+        "ref_separation": ref_sep,
+        "cur_separation": cur_sep,
+        "failed_conditions": failed,
+        "qualified": not failed,
+    }
+    return ("qualified_near_tie" if not failed else "failed"), qualification
+
+
+def compare_cross_geometry(
+    ref_summary_path, ref_metrics_path, cur_summary, per_step_store, label, gate_mode="exact"
+):
+    """Cross-geometry token-identity comparison on the frozen manifest.
+
+    Compares THIS run's greedy token trajectories row-by-row against a sealed
+    reference run of a DIFFERENT parallel geometry (TP4 or TP4/EP4 vs the
+    accepted Stage-4 PP=4 serving-equivalent replay). Every fork retains the
+    full margin evidence: both sides' top-8 rows, the cross-logit separations
+    at the fork step, and the minimum top-1/top-2 separation over the shared
+    prefix. Structural failures (reference run not ok, missing rows/metrics,
+    retained-length mismatch) are problems in EVERY mode.
+
+    How a token fork gates the run depends on ``gate_mode``:
+
+    - ``exact`` (Stage-5 C5 contract, the default): any fork is a problem —
+      "any TP4/PP4 token mismatch" fails the item.
+    - ``qualified-tp4-pp4`` (Stage-6 C1 / plan.md Decision G, the
+      replan-authorized bounded classifier for the TP4-vs-PP4 gate only):
+      each fork is classified via :func:`classify_fork_decision_g`;
+      ``qualified_near_tie`` forks are retained as evidence without a
+      problem, ``failed`` forks append a problem naming every violated
+      condition. The allowed set is the hard-coded two sealed locations —
+      this is an evidence-bounded diagnostic exception, not a tolerance knob.
+    - ``diagnostic`` (Stage-6 C1 scope for TP4/EP4-vs-PP4): forks are fully
+      reported (classification ``diagnostic_fork``) but never problems —
+      that comparison "is not a cross-geometry equality or qualification
+      gate".
+
+    The returned evidence carries ``gate_mode``, per-row ``classification``
+    (``exact`` for fork-free rows), ``qualified_forks``/``failed_forks``
+    counts, and ``gate_result``: ``pass``/``fail`` for the two gate modes,
+    ``diagnostic`` for the diagnostic mode (``fail`` there only on
+    structural problems).
+    """
+    import torch
+
+    if gate_mode not in CROSS_GEOMETRY_GATE_MODES:
+        raise ValueError(f"unknown cross-geometry gate mode {gate_mode!r}")
+
+    problems = []
+    with open(ref_summary_path) as fh:
+        ref = json.load(fh)
+    ref_metrics = torch.load(ref_metrics_path, map_location="cpu", weights_only=False)
+    if not ref.get("ok"):
+        problems.append(f"cross_geometry: reference run {ref_summary_path} has ok=false")
+    ref_rows = {r["name"]: r for r in ref.get("rows", [])}
+
+    def logit_at(rec, token):
+        ids = rec.get("trt_top8_ids") or []
+        vals = rec.get("trt_top8_values") or []
+        return vals[ids.index(token)] if token in ids else None
+
+    def sep12(rec):
+        vals = rec.get("trt_top8_values") or []
+        return vals[0] - vals[1] if len(vals) >= 2 else None
+
+    rows_out = []
+    identical_rows = 0
+    forked_rows = 0
+    steps_compared = 0
+    for r in cur_summary["rows"]:
+        name = r["name"]
+        rr = ref_rows.get(name)
+        if rr is None:
+            problems.append(f"cross_geometry: row {name} missing from reference summary")
+            continue
+        ref_toks = rr.get("trt_tokens") or []
+        cur_toks = r.get("trt_tokens") or []
+        if len(ref_toks) != len(cur_toks):
+            problems.append(
+                f"cross_geometry: {name} retains {len(ref_toks)} reference vs "
+                f"{len(cur_toks)} current tokens"
+            )
+            continue
+        rp = ref_metrics.get(name)
+        cp = per_step_store.get(name)
+        if rp is None or cp is None or len(rp) != len(cp) or len(cp) != len(cur_toks):
+            problems.append(
+                f"cross_geometry: {name} per-step records mismatch — "
+                f"{len(rp) if rp else 0} reference vs {len(cp) if cp else 0} current "
+                f"records for {len(cur_toks)} tokens"
+            )
+            continue
+        fork_step = next(
+            (i for i in range(len(cur_toks)) if int(cur_toks[i]) != int(ref_toks[i])), None
+        )
+        prefix = len(cur_toks) if fork_step is None else fork_step
+        steps_compared += len(cur_toks)
+        # Margin trail over the shared prefix: each side's own top-1/top-2
+        # separation minimized over the identical-token window — the per-step
+        # margin evidence the C5 directive asks for when geometries fork.
+        min_ref = min_cur = None
+        for i in range(prefix):
+            rs, cs = sep12(rp[i]), sep12(cp[i])
+            if rs is not None and (min_ref is None or rs < min_ref["separation"]):
+                min_ref = {"step": i, "separation": rs}
+            if cs is not None and (min_cur is None or cs < min_cur["separation"]):
+                min_cur = {"step": i, "separation": cs}
+        row_out = {
+            "name": name,
+            "steps": len(cur_toks),
+            "token_identical": fork_step is None,
+            "identical_prefix_steps": prefix,
+            "min_ref_top1_top2_separation": min_ref,
+            "min_cur_top1_top2_separation": min_cur,
+        }
+        if fork_step is None:
+            identical_rows += 1
+            row_out["classification"] = "exact"
+        else:
+            forked_rows += 1
+            a, b = int(ref_toks[fork_step]), int(cur_toks[fork_step])
+            rrec, crec = rp[fork_step], cp[fork_step]
+            row_out["fork"] = {
+                "step": fork_step,
+                "ref_token": a,
+                "cur_token": b,
+                "ref_logit_at_ref_token": logit_at(rrec, a),
+                "ref_logit_at_cur_token": logit_at(rrec, b),
+                "cur_logit_at_ref_token": logit_at(crec, a),
+                "cur_logit_at_cur_token": logit_at(crec, b),
+                "ref_top8_ids": rrec.get("trt_top8_ids"),
+                "ref_top8_values": rrec.get("trt_top8_values"),
+                "cur_top8_ids": crec.get("trt_top8_ids"),
+                "cur_top8_values": crec.get("trt_top8_values"),
+            }
+            if gate_mode == "exact":
+                # Stage-5 C5: any cross-geometry token mismatch FAILS the run.
+                # The margins retained above are the replan evidence, not a waiver.
+                row_out["classification"] = "failed"
+                problems.append(
+                    f"cross_geometry: {label} row {name} token fork at step {fork_step} "
+                    f"(reference token {a} vs current token {b}) — exact token identity "
+                    f"is required; first-fork margins retained in cross_geometry.row_results"
+                )
+            elif gate_mode == "qualified-tp4-pp4":
+                classification, qualification = classify_fork_decision_g(name, row_out["fork"])
+                row_out["classification"] = classification
+                row_out["fork"]["qualification"] = qualification
+                if classification == "failed":
+                    problems.append(
+                        f"cross_geometry: {label} row {name} token fork at step {fork_step} "
+                        f"(reference token {a} vs current token {b}) UNQUALIFIED under "
+                        f"Decision G: " + "; ".join(qualification["failed_conditions"])
+                    )
+            else:  # diagnostic — reported fully, never a problem (Stage-6 C1 EP scope)
+                row_out["classification"] = "diagnostic_fork"
+        rows_out.append(row_out)
+    qualified_forks = sum(1 for r in rows_out if r.get("classification") == "qualified_near_tie")
+    failed_forks = sum(1 for r in rows_out if r.get("classification") == "failed")
+    if gate_mode == "diagnostic":
+        gate_result = "fail" if problems else "diagnostic"
+    else:
+        gate_result = "fail" if problems else "pass"
+    evidence = {
+        "label": label,
+        "evaluated": True,
+        "gate_mode": gate_mode,
+        "reference_summary": ref_summary_path,
+        "reference_metrics": ref_metrics_path,
+        "reference_mapping": {
+            "tensor_parallel_size": ref.get("config", {}).get("tensor_parallel_size"),
+            "pipeline_parallel_size": ref.get("config", {}).get("pipeline_parallel_size"),
+            "configuration": ref.get("config", {}).get("configuration"),
+        },
+        "rows_compared": len(rows_out),
+        "steps_compared": steps_compared,
+        "identical_rows": identical_rows,
+        "forked_rows": forked_rows,
+        "qualified_forks": qualified_forks,
+        "failed_forks": failed_forks,
+        "token_identical": bool(rows_out) and forked_rows == 0 and not problems,
+        "gate_result": gate_result,
+        "row_results": rows_out,
+    }
+    return evidence, problems
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/dev/shm/GLM-5.3-Flash")
     parser.add_argument("--pp", type=int, default=8)
@@ -542,6 +875,14 @@ def main() -> int:
         help="tensor_parallel_size. Stage-5 TP4 real-runtime replay passes "
         "--tp 4 --pp 1; the world size (tp*pp) is what the per-rank CUDA-graph "
         "ladder audit requires every rank to have captured.",
+    )
+    parser.add_argument(
+        "--ep",
+        type=int,
+        default=None,
+        help="moe_expert_parallel_size; omit for TP-only MoE (moe_ep_size=1). "
+        "For the Stage-5 TP4/EP4 replay pass --tp 4 --ep 4 (moe_tp_size=1, "
+        "moe_ep_size=4), matching the geometry-parametric serve driver.",
     )
     parser.add_argument("--config", choices=["B", "E"], default="B")
     parser.add_argument("--short-steps", type=int, default=32)
@@ -591,9 +932,51 @@ def main() -> int:
         "serving-equivalent diagnostics run with this flag so the engine "
         "caps match the graded serve pair exactly",
     )
+    parser.add_argument(
+        "--cross-geometry-ref",
+        default=None,
+        help="sealed summary JSON from a DIFFERENT parallel geometry (the "
+        "accepted Stage-4 PP=4 serving-equivalent replay): compare per-row "
+        "greedy token trajectories on the frozen manifest. How a token fork "
+        "gates the run is selected by --cross-geometry-gate; structural "
+        "mismatches are problems in every mode.",
+    )
+    parser.add_argument(
+        "--cross-geometry-metrics",
+        default=None,
+        help="reference per-step metrics .pt (required with --cross-geometry-ref)",
+    )
+    parser.add_argument(
+        "--cross-geometry-label",
+        default="cross-geometry",
+        help="label recorded in the cross_geometry evidence (e.g. 'TP4-vs-PP4-B')",
+    )
+    parser.add_argument(
+        "--cross-geometry-gate",
+        choices=list(CROSS_GEOMETRY_GATE_MODES),
+        default="exact",
+        help="fork gating: 'exact' = any fork fails (Stage-5 C5 contract, "
+        "default); 'qualified-tp4-pp4' = Decision-G bounded classifier for "
+        "the Stage-6 TP4-vs-PP4 gate (only the two sealed near-tie locations "
+        "may qualify, fail-closed on everything else); 'diagnostic' = forks "
+        "fully reported but never problems (Stage-6 TP4/EP4-vs-PP4 scope)",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     if bool(args.compare_with) != bool(args.compare_with_metrics):
         parser.error("--compare-with and --compare-with-metrics must be given together")
+    if bool(args.cross_geometry_ref) != bool(args.cross_geometry_metrics):
+        parser.error("--cross-geometry-ref and --cross-geometry-metrics must be given together")
+    try:
+        moe_tp, moe_ep, mapping_label, moe_llm_kwargs = resolve_moe_parallel(
+            args.tp, args.pp, args.ep
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.state_digest_dir:
         sd = os.path.abspath(args.state_digest_dir)
         os.makedirs(sd, exist_ok=True)
@@ -646,6 +1029,9 @@ def main() -> int:
             "model": args.model,
             "tensor_parallel_size": args.tp,
             "pipeline_parallel_size": args.pp,
+            "moe_expert_parallel_size": moe_ep,
+            "moe_tensor_parallel_size": moe_tp,
+            "mapping_label": mapping_label,
             "world_size": args.tp * args.pp,
             "configuration": args.config,
             "cuda_graph": enabled,
@@ -744,6 +1130,7 @@ def main() -> int:
             gather_generation_logits=True,
             disable_overlap_scheduler=not enabled,
             cuda_graph_config=graph_config,
+            **moe_llm_kwargs,
         )
         summary["load_seconds"] = round(time.time() - started, 1)
         print(f"[replay] engine up in {summary['load_seconds']}s", flush=True)
@@ -924,6 +1311,30 @@ def main() -> int:
                 f"[replay] be_equivalence: rows={be_evidence['rows_compared']} "
                 f"steps={be_evidence['steps_compared']} "
                 f"bitwise_identical={be_evidence['bitwise_identical']}",
+                flush=True,
+            )
+
+        if args.cross_geometry_ref:
+            xg_evidence, xg_problems = compare_cross_geometry(
+                args.cross_geometry_ref,
+                args.cross_geometry_metrics,
+                summary,
+                per_step_store,
+                args.cross_geometry_label,
+                gate_mode=args.cross_geometry_gate,
+            )
+            summary["cross_geometry"] = xg_evidence
+            problems.extend(xg_problems)
+            print(
+                f"[replay] cross_geometry({xg_evidence['label']}): "
+                f"rows={xg_evidence['rows_compared']} "
+                f"steps={xg_evidence['steps_compared']} "
+                f"token_identical={xg_evidence['token_identical']} "
+                f"forked_rows={xg_evidence['forked_rows']} "
+                f"gate_mode={xg_evidence['gate_mode']} "
+                f"qualified_forks={xg_evidence['qualified_forks']} "
+                f"failed_forks={xg_evidence['failed_forks']} "
+                f"gate_result={xg_evidence['gate_result']}",
                 flush=True,
             )
 

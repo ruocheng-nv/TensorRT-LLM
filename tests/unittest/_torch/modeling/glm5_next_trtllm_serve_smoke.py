@@ -60,10 +60,15 @@ evidence:
   else stays a model failure. The summary JSON and an ``<summary>.exit.txt``
   marker are written on EVERY exit path.
 
-Run (all eight GPUs must be free):
+Geometry is parametric (``--tp``/``--pp``/``--ep``): the Stage-4 record used
+``--pp 8``; Stage-5 single-node production serving uses ``--tp 4`` (TP4) and
+``--tp 4 --ep 4`` (TP4/EP4). The per-rank graph-ladder audit keys on
+``world_size = tp * pp`` so every worker rank must capture under config E.
+
+Run (four GPUs free; Stage-5 TP4/EP4 config E):
     python tests/unittest/_torch/modeling/glm5_next_trtllm_serve_smoke.py \
-        --pp 8 --config B \
-        --summary reports/goal4.2-logs/trtllm_serve_smoke_b_pp8.json
+        --tp 4 --ep 4 --config E \
+        --summary reports/goal5.4-logs/serve-tp4ep4-e.json
 """
 
 from __future__ import annotations
@@ -622,7 +627,7 @@ def probe_child_package(env: dict) -> Tuple[Optional[dict], Optional[str]]:
 def build_serve_command(args, port: int, yaml_path: str) -> List[str]:
     exe = shutil.which("trtllm-serve")
     head = [exe] if exe else [sys.executable, "-m", "tensorrt_llm.commands.serve"]
-    return head + [
+    cmd = head + [
         args.model,
         "--backend",
         "pytorch",
@@ -631,7 +636,7 @@ def build_serve_command(args, port: int, yaml_path: str) -> List[str]:
         "--port",
         str(port),
         "--tensor_parallel_size",
-        "1",
+        str(args.tp),
         "--pipeline_parallel_size",
         str(args.pp),
         "--max_batch_size",
@@ -642,9 +647,17 @@ def build_serve_command(args, port: int, yaml_path: str) -> List[str]:
         str(args.max_seq_len),
         "--log_level",
         "info",
-        "--extra_llm_api_options",
-        yaml_path,
     ]
+    # Stage-5 TP4/EP4: only pass --moe_expert_parallel_size when an EP override
+    # is requested. With just --tensor_parallel_size=4 the Mapping resolves the
+    # MoE to moe_tp_size=4/moe_ep_size=1 (TP4); adding --moe_expert_parallel_size=4
+    # over the same four ranks resolves it to moe_tp_size=1/moe_ep_size=4
+    # (TP4/EP4). Absent (None) keeps the pre-Stage-5 single-geometry behaviour.
+    ep = getattr(args, "ep", None)
+    if ep is not None:
+        cmd += ["--moe_expert_parallel_size", str(ep)]
+    cmd += ["--extra_llm_api_options", yaml_path]
+    return cmd
 
 
 def write_extra_options_yaml(path: str, enabled: bool) -> str:
@@ -712,7 +725,15 @@ def shutdown_server(proc: subprocess.Popen, grace_s: float) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/dev/shm/GLM-5.3-Flash")
-    parser.add_argument("--pp", type=int, default=8)
+    parser.add_argument("--tp", type=int, default=1, help="tensor_parallel_size")
+    parser.add_argument("--pp", type=int, default=1, help="pipeline_parallel_size")
+    parser.add_argument(
+        "--ep",
+        type=int,
+        default=None,
+        help="moe_expert_parallel_size; omit for TP-only MoE (moe_ep_size=1). "
+        "For Stage-5 TP4/EP4 pass --tp 4 --ep 4 (moe_tp_size=1, moe_ep_size=4).",
+    )
     parser.add_argument("--config", choices=["B", "E"], default="B")
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--solo-tokens", type=int, default=32)
@@ -738,12 +759,32 @@ def main() -> int:
     enabled = args.config == "E"
     started = time.time()
 
+    # world_size = tp * pp is the number of MPI worker ranks; under pure TP every
+    # rank runs every decode step and must capture the graph ladder, so the
+    # per-rank ladder audit keys on world_size (not pp). MoE geometry: with an EP
+    # override the four ranks split experts (moe_tp=world//ep, moe_ep=ep); without
+    # it the MoE is tensor-parallel (moe_tp=tp, moe_ep=1).
+    world_size = args.tp * args.pp
+    if args.ep is not None:
+        moe_tp_size, moe_ep_size = world_size // args.ep, args.ep
+    else:
+        moe_tp_size, moe_ep_size = args.tp, 1
+    mapping_label = (
+        f"TP{args.tp}/EP{args.ep}" if args.ep is not None else f"TP{args.tp}"
+    )
+    if args.pp > 1:
+        mapping_label += f"/PP{args.pp}"
+
     summary: dict = {
         "config": {
             "model": args.model,
             "configuration": args.config,
-            "tensor_parallel_size": 1,
+            "mapping_label": mapping_label,
+            "tensor_parallel_size": args.tp,
             "pipeline_parallel_size": args.pp,
+            "moe_expert_parallel_size": moe_ep_size,
+            "moe_tensor_parallel_size": moe_tp_size,
+            "world_size": world_size,
             "max_batch_size": 4,
             "max_num_tokens": 4096,
             "max_seq_len": args.max_seq_len,
@@ -887,7 +928,10 @@ def main() -> int:
             enabled=enabled,
             expected_sizes=expected_sizes,
             engine_max_batch_size=4,
-            pp_size=args.pp,
+            # audit_graph_ladder's rank set is "every worker rank that must
+            # capture" — world_size (tp*pp), not just pp. Under TP4 that is
+            # ranks 0..3, each tagged [RANK k] by the MPI logger.
+            pp_size=world_size,
         )
         summary["graph_ladder"] = ladder
         problems.extend(ladder_problems)

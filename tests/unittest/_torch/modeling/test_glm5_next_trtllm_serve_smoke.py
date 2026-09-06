@@ -193,18 +193,47 @@ def test_write_extra_options_yaml(tmp_path):
     assert loaded_e["disable_overlap_scheduler"] is False
 
 
-def test_build_serve_command():
+def _serve_args(**overrides):
     class Args:
         model = "/dev/shm/GLM-5.3-Flash"
-        pp = 8
+        tp = 1
+        pp = 1
+        ep = None
         max_seq_len = 4096
 
-    argv = build_serve_command(Args(), 8123, "/tmp/extra.yaml")
-    assert Args.model in argv
+    for key, value in overrides.items():
+        setattr(Args, key, value)
+    return Args()
+
+
+def test_build_serve_command_pp8_record():
+    # The Stage-4 record geometry (--pp 8) still builds correctly.
+    argv = build_serve_command(_serve_args(pp=8), 8123, "/tmp/extra.yaml")
+    assert "/dev/shm/GLM-5.3-Flash" in argv
+    assert argv[argv.index("--tensor_parallel_size") + 1] == "1"
     assert argv[argv.index("--pipeline_parallel_size") + 1] == "8"
     assert argv[argv.index("--port") + 1] == "8123"
     assert argv[argv.index("--max_batch_size") + 1] == "4"
+    # No EP override => no --moe_expert_parallel_size flag.
+    assert "--moe_expert_parallel_size" not in argv
     assert argv[-2:] == ["--extra_llm_api_options", "/tmp/extra.yaml"]
+
+
+def test_build_serve_command_tp4():
+    # Stage-5 TP4: tp=4, no EP override (MoE resolves to moe_tp=4/moe_ep=1).
+    argv = build_serve_command(_serve_args(tp=4), 9001, "/tmp/e.yaml")
+    assert argv[argv.index("--tensor_parallel_size") + 1] == "4"
+    assert argv[argv.index("--pipeline_parallel_size") + 1] == "1"
+    assert "--moe_expert_parallel_size" not in argv
+    assert argv[-2:] == ["--extra_llm_api_options", "/tmp/e.yaml"]
+
+
+def test_build_serve_command_tp4ep4():
+    # Stage-5 TP4/EP4: tp=4 AND ep=4 (MoE resolves to moe_tp=1/moe_ep=4).
+    argv = build_serve_command(_serve_args(tp=4, ep=4), 9002, "/tmp/e.yaml")
+    assert argv[argv.index("--tensor_parallel_size") + 1] == "4"
+    assert argv[argv.index("--moe_expert_parallel_size") + 1] == "4"
+    assert argv[-2:] == ["--extra_llm_api_options", "/tmp/e.yaml"]
 
 
 # ---------------------------------------------------------------------------

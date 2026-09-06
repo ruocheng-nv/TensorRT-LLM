@@ -36,17 +36,35 @@ What one invocation proves, per the Stage-5 attention acceptance item:
    512 (at pool capacity), and 2100 (above index_topk=2048) tokens; batched
    request isolation, mid-request cancellation, and slot reuse are bitwise
    per rank.
-6. **B then E** — the eager legs run first; the E leg captures each family's
+6. **B then E** — the eager legs run first; the E legs capture each family's
    decode step in a ``torch.cuda.CUDAGraph`` **with the collectives inside**
    (KDA row o_proj all-reduce; indexer FP32 score all-reduce + MLA row
-   o_proj all-reduce) in lockstep on all four ranks and replays it with
-   fresh inputs. Capture success is the no-fallback hard-path proof; replays
-   must match eager within the predeclared envelope.
+   o_proj all-reduce) in lockstep on all four ranks:
+
+   * ``fixture_replay_E`` — **source_activation_replay under E**: the same
+     hooked-HF captured layer inputs/state the B leg replays drive graph
+     replays of the decode step (prefix prefilled from the fixture tokens,
+     the last four fixture tokens decoded through one captured graph per
+     layer), compared per step against the hooked in-model HF output rows,
+     the PP4-form single-rank decode, and the eager TP4 decode, with
+     rank-identical selection and bitwise cache-write checks.
+   * ``replay_E_boundary_ladder`` — the same captured-decode contract at the
+     exact ``index_topk=2048`` boundary and above it: one graph per sparse
+     layer captured at a 2046/2098-token prefix and replayed at kv_len
+     2047/2048/2049/2050 and 2099/2100/2101/2102, eager-compared on cloned
+     cache state with selection/sentinel checks and PP4-form anchoring.
+   * ``replay_E`` — the original synthetic-input capture/replay legs are
+     retained as supplementary evidence.
+
+   Capture success is the no-fallback hard-path proof; replays must match
+   eager within the predeclared envelope.
 
 Module-scope conventions follow the accepted Stage-3/Goal-5.1 precedent:
-``overlap_scheduler`` is a serving-level property (Goal 5.4); E here means
-CUDA-graph capture/replay of the production module forwards with collectives
-captured.
+``overlap_scheduler`` is a serving-level property; the paired real-runtime
+overlap evidence is the LLM-API TP4 E run (``llm-tp4-e.json``:
+CudaGraphConfig + overlap_scheduler=true + per-rank capture ladder). E here
+means CUDA-graph capture/replay of the production module forwards with
+collectives captured.
 """
 
 from __future__ import annotations
@@ -277,6 +295,12 @@ class AttnDriver(DenseDriver):
                 "q_proj_local": list(kda.q_proj.weight.shape),
                 "o_proj_local": list(kda.o_proj.weight.shape),
                 "prefill_dispatch": type(kda._kda_dispatch).__name__,
+                # NCCL-pin regression fields (iteration-42 fix): the row
+                # reduction must resolve NCCL, never the AUTO autotuner.
+                "o_proj_reduce_output": bool(kda.o_proj.reduce_output),
+                "o_proj_allreduce_strategy": kda.o_proj.all_reduce.strategy.name
+                if kda.o_proj.all_reduce is not None
+                else None,
             }
             ok = (
                 kda.num_heads == 16
@@ -285,6 +309,8 @@ class AttnDriver(DenseDriver):
                 and tuple(kda.A_log.shape) == (16,)
                 and tuple(kda.dt_bias.shape) == (2048,)
                 and tuple(kda.q_proj.weight.shape)[0] == 2048
+                and row["o_proj_reduce_output"]
+                and row["o_proj_allreduce_strategy"] == "NCCL"
             )
             row["pass"] = ok
             if not ok:
@@ -328,6 +354,14 @@ class AttnDriver(DenseDriver):
                 "score_all_reduce": type(idx.score_all_reduce).__name__
                 if idx.score_all_reduce is not None
                 else None,
+                # NCCL-pin regression fields (iteration-42 fix).
+                "score_all_reduce_strategy": idx.score_all_reduce.strategy.name
+                if idx.score_all_reduce is not None
+                else None,
+                "o_proj_reduce_output": bool(attn.o_proj.reduce_output),
+                "o_proj_allreduce_strategy": attn.o_proj.all_reduce.strategy.name
+                if attn.o_proj.all_reduce is not None
+                else None,
             }
             w_k, w_v_t = attn.absorbed_kv_b()
             row["absorbed_w_k"] = list(w_k.shape)
@@ -346,6 +380,9 @@ class AttnDriver(DenseDriver):
                 and tuple(idx.wk.weight.shape) == (128, 4096)
                 and tuple(w_k.shape) == (16, 256, 512)
                 and tuple(w_v_t.shape) == (16, 512, 256)
+                and row["score_all_reduce_strategy"] == "NCCL"
+                and row["o_proj_reduce_output"]
+                and row["o_proj_allreduce_strategy"] == "NCCL"
             )
             row["pass"] = ok
             if not ok:
@@ -1017,6 +1054,463 @@ class AttnDriver(DenseDriver):
         self.result["replay_E"] = rows
         self.comm.Barrier()
 
+    # -- source_activation_replay under E (hooked-HF inputs) -------------------
+
+    def fixture_replay_graph(self) -> None:
+        """source_activation_replay (E): hooked-HF fixture tokens through one
+        captured decode graph per layer.
+
+        The same captured HF layer inputs/state the B leg replays: the fixture
+        prefix (all but the last four tokens) is prefilled eagerly to build the
+        real per-layer cache state from HF activations, one decode step is
+        captured in a ``torch.cuda.CUDAGraph`` (collectives inside), the
+        pollution from warmup/capture is restored, and the last four fixture
+        tokens are decoded through graph **replays** whose per-step outputs are
+        compared against (a) the hooked in-model HF output rows
+        (FP8 envelope), (b) the PP4-form single-rank decode on identical state
+        (PP4 envelope), and (c) the eager TP4 decode on cloned state
+        (graph envelope, cache writes bitwise). Selection is recorded on the
+        eager comparator and must be bitwise identical across ranks; the
+        graph's own written index state must equal the eager clone's, which
+        pins the captured selection to the asserted one.
+        """
+        from test_glm5_next_attention import _kpool_metadata, _KpoolPools
+
+        rows = []
+        for layer_idx in KDA_LAYERS:
+            fx = self._fixture_prompt(layer_idx)
+            x = fx["x"]
+            total = int(x.shape[0])
+            steps = 4
+            prefix = total - steps
+            kda = self.model.model.layers[layer_idx].self_attn
+            tp1 = self._tp1_kda(layer_idx)
+            slot = torch.tensor([0], device=self.device)
+
+            conv_g = torch.zeros(1, kda.conv_dim, 3, device=self.device, dtype=torch.bfloat16)
+            ssm_g = torch.zeros(1, kda.num_heads, 128, 128, device=self.device, dtype=torch.float32)
+            with torch.no_grad():
+                kda.forward_prefill(x[:prefix], [0, prefix], slot, conv_g, ssm_g, cached_lens=[0])
+            conv0, ssm0 = conv_g.clone(), ssm_g.clone()
+            static_x = torch.zeros(1, x.shape[-1], device=self.device, dtype=torch.bfloat16)
+            row = {
+                "layer": layer_idx,
+                "family": "kda",
+                "prompt_index": fx["prompt_index"],
+                "prefix_tokens": prefix,
+                "graph_decoded_positions": list(range(prefix, total)),
+                "collectives": ["o_proj all-reduce"],
+            }
+            try:
+                self.comm.Barrier()
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side), torch.no_grad():
+                    for _ in range(3):
+                        kda.forward_decode(static_x, slot, conv_g, ssm_g)
+                torch.cuda.current_stream().wait_stream(side)
+                torch.cuda.synchronize()
+                self.comm.Barrier()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph), torch.no_grad():
+                    static_y = kda.forward_decode(static_x, slot, conv_g, ssm_g)
+                row["captured"] = True
+                # Restore the state warmup/capture polluted; the replays then
+                # advance it sequentially through the real fixture tokens.
+                conv_g.copy_(conv0)
+                ssm_g.copy_(ssm0)
+                conv_e, ssm_e = conv0.clone(), ssm0.clone()
+                conv_1 = torch.zeros(1, tp1.conv_dim, 3, device=self.device, dtype=torch.bfloat16)
+                ssm_1 = torch.zeros(
+                    1, tp1.num_heads, 128, 128, device=self.device, dtype=torch.float32
+                )
+                with torch.no_grad():
+                    tp1.forward_prefill(
+                        x[:prefix], [0, prefix], slot, conv_1, ssm_1, cached_lens=[0]
+                    )
+                hd = kda.kda_head_range()
+                step_rows, ok = [], True
+                for pos in range(prefix, total):
+                    static_x.copy_(x[pos : pos + 1])
+                    self.comm.Barrier()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    replayed = static_y.detach().clone()
+                    with torch.no_grad():
+                        eager = kda.forward_decode(x[pos : pos + 1], slot, conv_e, ssm_e)
+                        pp4 = tp1.forward_decode(x[pos : pos + 1], slot, conv_1, ssm_1)
+                    m_eager = metrics(replayed.float(), eager.float())
+                    m_hf = metrics(replayed.float(), fx["y"][pos])
+                    m_pp4 = metrics(replayed.float(), pp4.float())
+                    step_rows.append(
+                        {
+                            "position": pos,
+                            "graph_vs_eager": m_eager,
+                            "graph_vs_hooked_hf": m_hf,
+                            "graph_vs_pp4_form": m_pp4,
+                        }
+                    )
+                    for label, m, env in (
+                        ("graph_vs_eager", m_eager, GRAPH_ENVELOPE),
+                        ("graph_vs_hooked_hf", m_hf, FP8_MODEL_ENVELOPE),
+                        ("graph_vs_pp4_form", m_pp4, PP4_FORM_ENVELOPE),
+                    ):
+                        bad = check_envelope(m, env)
+                        if bad:
+                            ok = False
+                            self.problems.append(
+                                f"fixture_E kda layer {layer_idx} pos {pos} {label}: {bad}"
+                            )
+                m_state_eager = metrics(ssm_g[0], ssm_e[0])
+                m_state_pp4 = metrics(ssm_g[0], ssm_1[0, hd[0] : hd[1]])
+                m_conv_eager = metrics(conv_g[0].float(), conv_e[0].float())
+                row.update(
+                    {
+                        "steps": step_rows,
+                        "ssm_state_graph_vs_eager": m_state_eager,
+                        "conv_state_graph_vs_eager": m_conv_eager,
+                        "ssm_state_slice_vs_pp4": m_state_pp4,
+                    }
+                )
+                if not m_state_eager["bitwise"] or not m_conv_eager["bitwise"]:
+                    ok = False
+                    self.problems.append(
+                        f"fixture_E kda layer {layer_idx}: graph-advanced state is not "
+                        "bitwise equal to the eager-advanced state"
+                    )
+                if check_envelope(m_state_pp4, STATE_ENVELOPE):
+                    ok = False
+                    self.problems.append(
+                        f"fixture_E kda layer {layer_idx} ssm_state_slice_vs_pp4: "
+                        f"{check_envelope(m_state_pp4, STATE_ENVELOPE)}"
+                    )
+                row["pass"] = ok
+                del graph
+            except Exception as exc:
+                row.update(
+                    {"captured": False, "error": f"{type(exc).__name__}: {exc}", "pass": False}
+                )
+                self.problems.append(
+                    f"fixture_E kda layer {layer_idx} capture/replay failed: {exc}"
+                )
+            rows.append(row)
+
+        for layer_idx in MLA_LAYERS:
+            fx = self._fixture_prompt(layer_idx)
+            x = fx["x"]
+            total = int(x.shape[0])
+            steps = 4
+            prefix = total - steps
+            attn = self.model.model.layers[layer_idx].self_attn
+            tp1 = self._tp1_mla(layer_idx)
+            tokens_per_block = 32
+            pages = total // tokens_per_block + 2
+            pools = _KpoolPools(attn, pages, tokens_per_block, self.device)
+            table = torch.arange(pages, device=self.device, dtype=torch.long).unsqueeze(0)
+            kv0 = torch.zeros(1, device=self.device, dtype=torch.long)
+            with torch.no_grad():
+                attn.forward_prefill(
+                    x[:prefix],
+                    [0, prefix],
+                    [0],
+                    _kpool_metadata(pools, block_tables=table, kv_lens=kv0, num_contexts=1),
+                )
+            latent0, index0 = pools.latent.clone(), pools.index.clone()
+            kv_buf = torch.tensor([prefix + 1], device=self.device)
+            decode_md = _kpool_metadata(
+                pools, block_tables=table, kv_lens=kv_buf, num_contexts=0, is_cuda_graph=True
+            )
+            static_x = torch.zeros(1, x.shape[-1], device=self.device, dtype=torch.bfloat16)
+
+            tp1_pools = _KpoolPools(tp1, pages, tokens_per_block, self.device)
+            with torch.no_grad():
+                tp1.forward_prefill(
+                    x[:prefix],
+                    [0, prefix],
+                    [0],
+                    _kpool_metadata(
+                        tp1_pools, block_tables=table, kv_lens=kv0.clone(), num_contexts=1
+                    ),
+                )
+            row = {
+                "layer": layer_idx,
+                "family": "sparse_mla",
+                "prompt_index": fx["prompt_index"],
+                "prefix_tokens": prefix,
+                "graph_decoded_positions": list(range(prefix, total)),
+                "collectives": ["indexer fp32 score all-reduce", "o_proj all-reduce"],
+            }
+            try:
+                self.comm.Barrier()
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side), torch.no_grad():
+                    for _ in range(3):
+                        attn.forward_decode(static_x, kv_buf, decode_md)
+                torch.cuda.current_stream().wait_stream(side)
+                torch.cuda.synchronize()
+                self.comm.Barrier()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph), torch.no_grad():
+                    static_y = attn.forward_decode(static_x, kv_buf, decode_md)
+                row["captured"] = True
+                pools.latent.copy_(latent0)
+                pools.index.copy_(index0)
+                step_rows, ok = [], True
+                for pos in range(prefix, total):
+                    static_x.copy_(x[pos : pos + 1])
+                    kv_buf.fill_(pos + 1)
+                    clone = _KpoolPools(attn, pages, tokens_per_block, self.device)
+                    clone.latent.copy_(pools.latent)
+                    clone.index.copy_(pools.index)
+                    eager_md = _kpool_metadata(
+                        clone, block_tables=table.clone(), kv_lens=kv_buf.clone(), num_contexts=0
+                    )
+                    with torch.no_grad(), _SelectRecorder(attn.indexer) as rec:
+                        eager = attn.forward_decode(
+                            x[pos : pos + 1].clone(), kv_buf.clone(), eager_md
+                        )
+                    sel_ok = self._assert_identical_across_ranks(
+                        rec.rows[-1], f"fixture_E mla layer {layer_idx} pos {pos} topk"
+                    )
+                    self.comm.Barrier()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    replayed = static_y.detach().clone()
+                    cache_bitwise = bool(
+                        torch.equal(pools.latent, clone.latent)
+                        and torch.equal(pools.index, clone.index)
+                    )
+                    kv1 = kv_buf.clone()
+                    md1 = _kpool_metadata(
+                        tp1_pools, block_tables=table, kv_lens=kv1, num_contexts=0
+                    )
+                    with torch.no_grad(), _SelectRecorder(tp1.indexer) as rec1:
+                        pp4 = tp1.forward_decode(x[pos : pos + 1].clone(), kv1, md1)
+                    jac = _jaccard(rec.rows[-1], rec1.rows[-1])
+                    m_eager = metrics(replayed.float(), eager.float())
+                    m_hf = metrics(replayed.float(), fx["y"][pos])
+                    m_pp4 = metrics(replayed.float(), pp4.float())
+                    step_rows.append(
+                        {
+                            "position": pos,
+                            "graph_vs_eager": m_eager,
+                            "graph_vs_hooked_hf": m_hf,
+                            "graph_vs_pp4_form": m_pp4,
+                            "selection_identical_across_ranks": sel_ok,
+                            "selection_jaccard_vs_pp4": jac,
+                            "cache_writes_bitwise_graph_vs_eager": cache_bitwise,
+                        }
+                    )
+                    if not sel_ok:
+                        ok = False
+                    if not cache_bitwise:
+                        ok = False
+                        self.problems.append(
+                            f"fixture_E mla layer {layer_idx} pos {pos}: graph cache writes "
+                            "diverged from eager"
+                        )
+                    if jac < 0.99:
+                        ok = False
+                        self.problems.append(
+                            f"fixture_E mla layer {layer_idx} pos {pos}: selection Jaccard "
+                            f"vs PP4 form {jac:.4f} < 0.99"
+                        )
+                    for label, m, env in (
+                        ("graph_vs_eager", m_eager, GRAPH_ENVELOPE),
+                        ("graph_vs_hooked_hf", m_hf, FP8_MODEL_ENVELOPE),
+                        ("graph_vs_pp4_form", m_pp4, PP4_FORM_ENVELOPE),
+                    ):
+                        bad = check_envelope(m, env)
+                        if bad:
+                            ok = False
+                            self.problems.append(
+                                f"fixture_E mla layer {layer_idx} pos {pos} {label}: {bad}"
+                            )
+                row["steps"] = step_rows
+                row["pass"] = ok
+                del graph
+            except Exception as exc:
+                row.update(
+                    {"captured": False, "error": f"{type(exc).__name__}: {exc}", "pass": False}
+                )
+                self.problems.append(
+                    f"fixture_E mla layer {layer_idx} capture/replay failed: {exc}"
+                )
+            rows.append(row)
+        self.result["fixture_replay_E"] = rows
+        self.comm.Barrier()
+
+    def graph_boundary_ladder(self) -> None:
+        """E cache coverage at and above ``index_topk=2048``.
+
+        One decode graph per (layer, prefix) is captured at a long synthetic
+        prefix and replayed across kv_len 2047/2048/2049/2050 (crossing the
+        exact boundary) and 2099/2100/2101/2102 (well above it, the eager
+        ladder's 2100 regime). Every replay is compared bitwise-on-cache /
+        envelope-on-output against an eager decode over cloned state, the
+        eager selection must be rank-identical with valid sentinel/width, and
+        the replayed output is anchored to the PP4-form single-rank decode.
+        """
+        from test_glm5_next_attention import _kpool_metadata, _KpoolPools
+
+        rows = []
+        index_topk = 2048
+        for layer_idx in (MLA_LAYERS[0], MLA_LAYERS[-1]):
+            attn = self.model.model.layers[layer_idx].self_attn
+            tp1 = self._tp1_mla(layer_idx)
+            for base_prefix in (2046, 2098):
+                steps = 4
+                total = base_prefix + steps
+                tokens_per_block = 32
+                pages = total // tokens_per_block + 2
+                pools = _KpoolPools(attn, pages, tokens_per_block, self.device)
+                table = torch.arange(pages, device=self.device, dtype=torch.long).unsqueeze(0)
+                x = _hidden(total, 5000 + layer_idx * 11 + base_prefix, self.device)
+                kv0 = torch.zeros(1, device=self.device, dtype=torch.long)
+                with torch.no_grad():
+                    attn.forward_prefill(
+                        x[:base_prefix],
+                        [0, base_prefix],
+                        [0],
+                        _kpool_metadata(pools, block_tables=table, kv_lens=kv0, num_contexts=1),
+                    )
+                latent0, index0 = pools.latent.clone(), pools.index.clone()
+                kv_buf = torch.tensor([base_prefix + 1], device=self.device)
+                decode_md = _kpool_metadata(
+                    pools, block_tables=table, kv_lens=kv_buf, num_contexts=0, is_cuda_graph=True
+                )
+                static_x = torch.zeros(1, x.shape[-1], device=self.device, dtype=torch.bfloat16)
+                tp1_pools = _KpoolPools(tp1, pages, tokens_per_block, self.device)
+                with torch.no_grad():
+                    tp1.forward_prefill(
+                        x[:base_prefix],
+                        [0, base_prefix],
+                        [0],
+                        _kpool_metadata(
+                            tp1_pools, block_tables=table, kv_lens=kv0.clone(), num_contexts=1
+                        ),
+                    )
+                row = {
+                    "layer": layer_idx,
+                    "family": "sparse_mla",
+                    "prefix_tokens": base_prefix,
+                    "kv_len_ladder": [base_prefix + 1 + s for s in range(steps)],
+                    "collectives": ["indexer fp32 score all-reduce", "o_proj all-reduce"],
+                }
+                try:
+                    self.comm.Barrier()
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side), torch.no_grad():
+                        for _ in range(3):
+                            attn.forward_decode(static_x, kv_buf, decode_md)
+                    torch.cuda.current_stream().wait_stream(side)
+                    torch.cuda.synchronize()
+                    self.comm.Barrier()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph), torch.no_grad():
+                        static_y = attn.forward_decode(static_x, kv_buf, decode_md)
+                    row["captured"] = True
+                    pools.latent.copy_(latent0)
+                    pools.index.copy_(index0)
+                    step_rows, ok = [], True
+                    for pos in range(base_prefix, total):
+                        kv_len = pos + 1
+                        static_x.copy_(x[pos : pos + 1])
+                        kv_buf.fill_(kv_len)
+                        clone = _KpoolPools(attn, pages, tokens_per_block, self.device)
+                        clone.latent.copy_(pools.latent)
+                        clone.index.copy_(pools.index)
+                        eager_md = _kpool_metadata(
+                            clone,
+                            block_tables=table.clone(),
+                            kv_lens=kv_buf.clone(),
+                            num_contexts=0,
+                        )
+                        with torch.no_grad(), _SelectRecorder(attn.indexer) as rec:
+                            eager = attn.forward_decode(
+                                x[pos : pos + 1].clone(), kv_buf.clone(), eager_md
+                            )
+                        sel_ok = self._assert_identical_across_ranks(
+                            rec.rows[-1],
+                            f"boundary_E mla layer {layer_idx} kv_len {kv_len} topk",
+                        )
+                        self.comm.Barrier()
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        replayed = static_y.detach().clone()
+                        cache_bitwise = bool(
+                            torch.equal(pools.latent, clone.latent)
+                            and torch.equal(pools.index, clone.index)
+                        )
+                        kv1 = kv_buf.clone()
+                        md1 = _kpool_metadata(
+                            tp1_pools, block_tables=table, kv_lens=kv1, num_contexts=0
+                        )
+                        with torch.no_grad(), _SelectRecorder(tp1.indexer) as rec1:
+                            pp4 = tp1.forward_decode(x[pos : pos + 1].clone(), kv1, md1)
+                        jac = _jaccard(rec.rows[-1], rec1.rows[-1])
+                        last = rec.rows[-1]
+                        width_ok = last.shape[-1] == attn.indexer.output_width
+                        valid = last[last >= 0]
+                        bounds_ok = bool((valid < kv_len).all()) if valid.numel() else False
+                        m_eager = metrics(replayed.float(), eager.float())
+                        m_pp4 = metrics(replayed.float(), pp4.float())
+                        step_rows.append(
+                            {
+                                "kv_len": kv_len,
+                                "regime": "below_2048"
+                                if kv_len < index_topk
+                                else ("exact_2048" if kv_len == index_topk else "above_2048"),
+                                "graph_vs_eager": m_eager,
+                                "graph_vs_pp4_form": m_pp4,
+                                "selection_identical_across_ranks": sel_ok,
+                                "selection_jaccard_vs_pp4": jac,
+                                "output_width": int(last.shape[-1]),
+                                "sentinel_bounds_ok": bounds_ok,
+                                "cache_writes_bitwise_graph_vs_eager": cache_bitwise,
+                            }
+                        )
+                        if not (sel_ok and cache_bitwise and width_ok and bounds_ok):
+                            ok = False
+                            self.problems.append(
+                                f"boundary_E mla layer {layer_idx} kv_len {kv_len}: "
+                                f"sel={sel_ok} cache={cache_bitwise} width={width_ok} "
+                                f"bounds={bounds_ok}"
+                            )
+                        if jac < 0.99:
+                            ok = False
+                            self.problems.append(
+                                f"boundary_E mla layer {layer_idx} kv_len {kv_len}: "
+                                f"selection Jaccard vs PP4 form {jac:.4f} < 0.99"
+                            )
+                        for label, m, env in (
+                            ("graph_vs_eager", m_eager, GRAPH_ENVELOPE),
+                            ("graph_vs_pp4_form", m_pp4, PP4_FORM_ENVELOPE),
+                        ):
+                            bad = check_envelope(m, env)
+                            if bad:
+                                ok = False
+                                self.problems.append(
+                                    f"boundary_E mla layer {layer_idx} kv_len {kv_len} "
+                                    f"{label}: {bad}"
+                                )
+                    row["steps"] = step_rows
+                    row["pass"] = ok
+                    del graph
+                except Exception as exc:
+                    row.update(
+                        {"captured": False, "error": f"{type(exc).__name__}: {exc}", "pass": False}
+                    )
+                    self.problems.append(
+                        f"boundary_E mla layer {layer_idx} prefix {base_prefix} "
+                        f"capture/replay failed: {exc}"
+                    )
+                rows.append(row)
+        self.result["replay_E_boundary_ladder"] = rows
+        self.comm.Barrier()
+
     # -- orchestration --------------------------------------------------------
 
     def run(self, json_path: str) -> int:  # noqa: D102 — see module docstring
@@ -1030,6 +1524,8 @@ class AttnDriver(DenseDriver):
             self.length_ladder()
             self.isolation_and_reuse()
             self.replay_graph_attention()
+            self.fixture_replay_graph()
+            self.graph_boundary_ladder()
             self.result["driver_seconds"] = round(time.time() - t0, 1)
         except Exception:
             self.problems.append(f"driver exception: {traceback.format_exc(limit=8)}")
@@ -1049,7 +1545,15 @@ class AttnDriver(DenseDriver):
                 "conventions": [
                     "E = module-scope CUDA-graph capture/replay with collectives inside "
                     "(accepted Stage-3/Goal-5.1 partial_model convention)",
-                    "overlap_scheduler is a serving-level property owned by Goal 5.4",
+                    "fixture_replay_E is the source_activation_replay E leg: the same "
+                    "hooked-HF captured layer inputs/state as fixture_replay_B, decoded "
+                    "through captured graphs with per-step HF/PP4/eager metrics",
+                    "replay_E_boundary_ladder covers kv_len 2047/2048/2049/2050 and "
+                    "2099/2100/2101/2102 under one captured graph per prefix (exact and "
+                    "above index_topk=2048 cache regimes in E)",
+                    "the paired overlap_scheduler=true runtime evidence is the LLM-API "
+                    "TP4 E run (llm-tp4-e.json: CudaGraphConfig + overlap + per-rank "
+                    "capture ladder); serving-level TP4 B/E belongs to Goal 5.4",
                     "PP4-form reference = the bf16-dequant single-rank modules the accepted "
                     "Stage-3 replay validated (same class, same weights, full 64 heads)",
                 ],

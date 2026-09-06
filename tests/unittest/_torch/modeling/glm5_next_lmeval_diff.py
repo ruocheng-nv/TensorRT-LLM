@@ -12,6 +12,15 @@ uses — with the same ``(dataset_path, random_seed, num_samples)``, so their
     doc_id, recomputes per-filter scores from the stored ``exact_match``
     values, and lists doc_ids where one side is correct and the other wrong.
 
+    Scoring is FAIL-CLOSED (Stage-6 C2 "all samples scored"): the expected
+    filter set is the union across ALL rows of BOTH sides and must be
+    nonempty; every shared doc must carry a present, finite value for every
+    expected filter on both sides. Any missing or non-finite per-row filter
+    is recorded in ``scoring_problems`` and drives ``complete_scoring=false``
+    and a nonzero exit — a missing score is never silently counted as 0.0.
+    Per-filter ``n`` is the number of docs with valid scores on both sides
+    (``expected_n`` = all shared docs); with complete scoring they are equal.
+
 ``truncation``
     Tokenizes every stored response with the checkpoint tokenizer and reports
     rows that consumed the whole decode budget. A budget-length row counts as
@@ -108,6 +117,8 @@ def filters_of(sample):
 
 
 def run_diff(args) -> int:
+    import math
+
     hf_path, hf = load_samples(args.hf)
     trt_path, trt = load_samples(args.trt)
 
@@ -118,6 +129,10 @@ def run_diff(args) -> int:
         "num_trt": len(trt),
         "doc_id_aligned": sorted(hf.keys()) == sorted(trt.keys()),
         "prompt_mismatches": [],
+        "expected_filters": [],
+        "scoring_problems": [],
+        "scoring_problem_count": 0,
+        "complete_scoring": False,
         "scores": {},
         "discriminating": {},
     }
@@ -127,26 +142,47 @@ def run_diff(args) -> int:
         if prompt_of(hf[doc_id]) != prompt_of(trt[doc_id]):
             report["prompt_mismatches"].append(doc_id)
 
-    filter_names = sorted(filters_of(hf[shared[0]])) if shared else []
+    # Fail-closed scoring: expected filters = union over ALL rows of BOTH
+    # sides (never just the first HF row); every shared doc must carry a
+    # present, finite value for every expected filter on both sides.
+    filter_names = sorted({n for rows in (hf, trt) for d in rows for n in filters_of(rows[d])})
+    report["expected_filters"] = filter_names
+    scoring_problems = []
+    if not filter_names:
+        scoring_problems.append("no score filters found on either side (empty filter set)")
+    valid = {}  # (name) -> {doc_id: (hf_val, trt_val)} for present+finite pairs
     for name in filter_names:
-        hf_score = sum(filters_of(hf[d]).get(name, 0.0) for d in shared)
-        trt_score = sum(filters_of(trt[d]).get(name, 0.0) for d in shared)
-        hf_right_trt_wrong = [
-            d
-            for d in shared
-            if filters_of(hf[d]).get(name, 0.0) > 0.5 > filters_of(trt[d]).get(name, 0.0)
-        ]
-        trt_right_hf_wrong = [
-            d
-            for d in shared
-            if filters_of(trt[d]).get(name, 0.0) > 0.5 > filters_of(hf[d]).get(name, 0.0)
-        ]
+        valid[name] = {}
+        for d in shared:
+            pair = []
+            for side, rows in (("hf", hf), ("trt", trt)):
+                v = filters_of(rows[d]).get(name)
+                if v is None:
+                    scoring_problems.append(f"doc {d}: missing {side} filter '{name}'")
+                elif not math.isfinite(float(v)):
+                    scoring_problems.append(f"doc {d}: non-finite {side} filter '{name}' = {v!r}")
+                else:
+                    pair.append(float(v))
+            if len(pair) == 2:
+                valid[name][d] = (pair[0], pair[1])
+    report["scoring_problem_count"] = len(scoring_problems)
+    report["scoring_problems"] = scoring_problems[:50]
+    report["complete_scoring"] = bool(filter_names) and not scoring_problems
+
+    for name in filter_names:
+        pairs = valid[name]
+        docs = sorted(pairs)
+        hf_score = sum(pairs[d][0] for d in docs)
+        trt_score = sum(pairs[d][1] for d in docs)
+        hf_right_trt_wrong = [d for d in docs if pairs[d][0] > 0.5 > pairs[d][1]]
+        trt_right_hf_wrong = [d for d in docs if pairs[d][1] > 0.5 > pairs[d][0]]
         report["scores"][name] = {
             "hf": hf_score,
             "trt": trt_score,
-            "n": len(shared),
-            "hf_pct": round(100.0 * hf_score / max(len(shared), 1), 2),
-            "trt_pct": round(100.0 * trt_score / max(len(shared), 1), 2),
+            "n": len(docs),
+            "expected_n": len(shared),
+            "hf_pct": round(100.0 * hf_score / max(len(docs), 1), 2),
+            "trt_pct": round(100.0 * trt_score / max(len(docs), 1), 2),
         }
         report["discriminating"][name] = {
             "hf_correct_trt_wrong": [
@@ -182,17 +218,20 @@ def run_diff(args) -> int:
 
     print(
         f"[diff] aligned={report['doc_id_aligned']} "
-        f"prompt_mismatches={len(report['prompt_mismatches'])}"
+        f"prompt_mismatches={len(report['prompt_mismatches'])} "
+        f"complete_scoring={report['complete_scoring']} "
+        f"scoring_problems={report['scoring_problem_count']}"
     )
     for name, s in report["scores"].items():
         disc = report["discriminating"][name]
         print(
             f"[diff] {name}: HF {s['hf']:.0f}/{s['n']} ({s['hf_pct']}%) vs TRT {s['trt']:.0f}/{s['n']} "
-            f"({s['trt_pct']}%) | HF-right/TRT-wrong {len(disc['hf_correct_trt_wrong'])} "
+            f"({s['trt_pct']}%) | valid n {s['n']}/{s['expected_n']} "
+            f"| HF-right/TRT-wrong {len(disc['hf_correct_trt_wrong'])} "
             f"| TRT-right/HF-wrong {len(disc['trt_correct_hf_wrong'])}"
         )
     print(f"[diff] wrote {args.out}")
-    ok = report["doc_id_aligned"] and not report["prompt_mismatches"]
+    ok = report["doc_id_aligned"] and not report["prompt_mismatches"] and report["complete_scoring"]
     return 0 if ok else 1
 
 

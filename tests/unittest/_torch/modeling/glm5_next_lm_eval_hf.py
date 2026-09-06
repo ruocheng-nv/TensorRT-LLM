@@ -31,6 +31,26 @@ generates to EOS/budget and post-truncates the *text* at the earliest
 EOS ids come from the checkpoint's ``generation_config`` exactly as the LLM
 API consumes them. Rows that hit the token budget without a natural stop are
 counted as truncated and fail the run (zero-truncation contract).
+
+Budget-raise replay (``--replay-from``): re-issuing this reference at a
+LARGER decode budget does not require regenerating rows that provably did
+not consume the old budget. Under deterministic greedy decoding the token
+trajectory is a fixed prefix property: a row whose sealed scored text
+retokenizes to fewer than ``old_budget - AT_BUDGET_SLACK`` tokens either
+stopped at EOS below the old cap or was text-cut at a task ``until`` string
+inside the greedy prefix — in both cases the scored text is byte-identical
+at any larger budget, so it is served verbatim from the sealed sample cache.
+Only rows at/near the old cap (the sealed runaways) are natively regenerated
+at the new budget; the HF model is loaded lazily and only when at least one
+row needs regeneration. Every row — replayed or regenerated — is re-scored
+through the same ``tensorrt_llm.evaluate.GSM8K`` harness, so the produced
+``samples_gsm8k.json`` is a genuine harness artifact at the new budget, not
+a hand-spliced file. Fail-closed: an unknown or already-served rendered
+prompt, a sealed row left unrequested, or a budget that is not strictly
+larger than the qualification budget all abort. A regenerated row that hits
+the NEW budget is a problem unless its doc id was explicitly pre-declared
+via ``--disclosed-runaway-doc-ids`` (the iteration-21 human override: a
+native-HF runaway is disclosed, not blocking).
 """
 
 from __future__ import annotations
@@ -200,6 +220,132 @@ class _BatchedHfRunner:
             )
 
 
+class _CachedReplayRunner(_BatchedHfRunner):
+    """Budget-raise replay over a sealed lm-eval sample cache.
+
+    ``cache_by_prompt`` maps each sealed rendered prompt to
+    ``{"doc_id", "text", "resp_tokens"}``. A row qualifies for verbatim
+    replay iff ``resp_tokens < qualify_budget - slack`` (its scored text is
+    budget-invariant under greedy decoding, see module docstring); every
+    other row is queued for native regeneration through the inherited
+    batched ``generate`` path, and the HF model is built lazily on the first
+    flush that actually has regeneration work.
+    """
+
+    def __init__(
+        self,
+        model_builder,
+        tokenizer,
+        batch_size: int,
+        max_prompt_tokens: int,
+        cache_by_prompt: Dict[str, Dict[str, Any]],
+        qualify_budget: int,
+        slack: int,
+    ):
+        super().__init__(
+            model=None,
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            max_prompt_tokens=max_prompt_tokens,
+        )
+        self._model_builder = model_builder
+        self._cache = dict(cache_by_prompt)
+        self._qualify_budget = int(qualify_budget)
+        self._slack = int(slack)
+        self.replayed_doc_ids: List[int] = []
+        self.regen_doc_ids: List[int] = []
+        self._regen_doc_by_prompt: Dict[str, int] = {}
+
+    def unserved_cache_rows(self) -> int:
+        return len(self._cache)
+
+    def generate_async(self, prompt, sampling_params=None, streaming=False):
+        assert not streaming, "streaming is not part of this reference driver"
+        entry = self._cache.pop(prompt, None)
+        assert entry is not None, (
+            "rendered prompt not found (or already served) in the sealed sample "
+            "cache — matched-config drift; refusing to fabricate a reference row"
+        )
+        new_budget = int(sampling_params.max_tokens)
+        assert new_budget > self._qualify_budget, (
+            f"replay is only valid when the budget is raised: new budget "
+            f"{new_budget} must be > qualification budget {self._qualify_budget}"
+        )
+        if entry["resp_tokens"] < self._qualify_budget - self._slack:
+            out = _PendingOutput(self, prompt, sampling_params)
+            completion = out.outputs[0]
+            completion.text = entry["text"]
+            completion.finish_reason = "stop"
+            out.done = True
+            self.pending.append(out)
+            self.replayed_doc_ids.append(entry["doc_id"])
+            self.completed_rows.append(
+                {
+                    "doc_id": entry["doc_id"],
+                    "replayed": True,
+                    "generated_tokens": entry["resp_tokens"],
+                    "budget": new_budget,
+                    "truncated": False,
+                    "stop_string_hit": None,
+                }
+            )
+            return out
+        handle = super().generate_async(prompt, sampling_params)
+        self.regen_doc_ids.append(entry["doc_id"])
+        self._regen_doc_by_prompt[prompt] = entry["doc_id"]
+        return handle
+
+    def flush(self):
+        if self.model is None and any(not p.done for p in self.pending):
+            self.model = self._model_builder()
+        super().flush()
+
+    def regen_truncated_doc_ids(self) -> List[int]:
+        return sorted(
+            self._regen_doc_by_prompt[p.prompt]
+            for p in self.pending
+            if p.prompt in self._regen_doc_by_prompt
+            and p.done
+            and p.outputs[0].finish_reason == "length"
+        )
+
+
+def native_truncation_report(rows, tokenizer, budget, disclosed_runaway_doc_ids):
+    """Classify native-generation truncations by doc_id, split disclosed vs not.
+
+    ``rows`` maps doc_id -> sample dict (as returned by
+    ``glm5_next_lmeval_diff.load_samples``). A row counts as truncated when its
+    scored text reaches the decode budget (within ``AT_BUDGET_SLACK`` tokens)
+    carrying neither a ``####`` answer marker nor the ``Question:`` stop string
+    — i.e. generation stopped only because it hit the cap, under the SAME
+    marker/until semantics the session truncation audit uses. Disclosed
+    runaways (e.g. the iteration-21 native-HF doc 786) are reported but not
+    treated as a problem, mirroring the budget-raise replay path; every other
+    truncation fails closed. Keyed by doc_id so the native reference's ok flag
+    matches the session's doc_id-keyed truncation audit rather than relying on
+    generation-order row indices.
+    """
+    from glm5_next_lmeval_diff import ANSWER_MARKER, AT_BUDGET_SLACK, response_of
+
+    disclosed = sorted(int(x) for x in disclosed_runaway_doc_ids)
+    truncated = []
+    for doc_id in sorted(rows):
+        rtext = response_of(rows[doc_id])
+        n_tok = len(tokenizer.encode(rtext, add_special_tokens=False))
+        if (
+            n_tok >= budget - AT_BUDGET_SLACK
+            and ANSWER_MARKER not in rtext
+            and "Question:" not in rtext
+        ):
+            truncated.append(int(doc_id))
+    undisclosed = [d for d in truncated if d not in disclosed]
+    return {
+        "truncated_doc_ids": truncated,
+        "disclosed_runaway_doc_ids": disclosed,
+        "undisclosed_truncated_doc_ids": undisclosed,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", default="/dev/shm/GLM-5.3-Flash")
@@ -214,7 +360,31 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--output-dir", required=True, help="per-sample artifacts land here")
     parser.add_argument("--summary", required=True)
+    parser.add_argument(
+        "--replay-from",
+        default=None,
+        help="sealed samples_gsm8k.json (or its directory) to replay budget-invariant rows from",
+    )
+    parser.add_argument(
+        "--replay-qualify-budget",
+        type=int,
+        default=None,
+        help="decode budget the sealed run used; rows below budget-slack tokens replay verbatim",
+    )
+    parser.add_argument(
+        "--disclosed-runaway-doc-ids",
+        default="",
+        help="comma-separated doc ids whose regeneration may hit the new budget without failing",
+    )
     args = parser.parse_args()
+    if args.replay_from:
+        assert args.replay_qualify_budget, "--replay-from requires --replay-qualify-budget"
+        assert args.max_output_length > args.replay_qualify_budget, (
+            "replay mode is a budget RAISE: --max-output-length must exceed --replay-qualify-budget"
+        )
+    disclosed_runaways = sorted(
+        int(x) for x in args.disclosed_runaway_doc_ids.split(",") if x.strip()
+    )
 
     import torch
     from glm5_next_hf_gsm8k_reference import build_model
@@ -258,7 +428,48 @@ def main() -> int:
     }
 
     try:
-        tokenizer, _config, model = build_model(args.checkpoint)
+        if args.replay_from:
+            from glm5_next_lmeval_diff import AT_BUDGET_SLACK, load_samples, prompt_of, response_of
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
+            src_path, src_rows = load_samples(args.replay_from)
+            cache: Dict[str, Dict[str, Any]] = {}
+            for doc_id in sorted(src_rows):
+                prompt = prompt_of(src_rows[doc_id])
+                text = response_of(src_rows[doc_id])
+                assert prompt and prompt not in cache, (
+                    f"empty or duplicate rendered prompt in sealed cache (doc {doc_id})"
+                )
+                cache[prompt] = {
+                    "doc_id": doc_id,
+                    "text": text,
+                    "resp_tokens": len(tokenizer.encode(text, add_special_tokens=False)),
+                }
+            summary["config"]["engine"] = (
+                "sealed-sample budget-raise replay + native HF model.generate "
+                "regeneration for at/near-cap rows (lazy load)"
+            )
+            summary["config"]["replay_from"] = src_path
+            summary["config"]["replay_qualify_budget"] = args.replay_qualify_budget
+            runner = _CachedReplayRunner(
+                model_builder=lambda: build_model(args.checkpoint)[2],
+                tokenizer=tokenizer,
+                batch_size=args.batch_size,
+                max_prompt_tokens=args.max_input_length,
+                cache_by_prompt=cache,
+                qualify_budget=args.replay_qualify_budget,
+                slack=AT_BUDGET_SLACK,
+            )
+            replay_source_sha = sha256_of(src_path)
+        else:
+            tokenizer, _config, model = build_model(args.checkpoint)
+            runner = _BatchedHfRunner(
+                model,
+                tokenizer,
+                batch_size=args.batch_size,
+                max_prompt_tokens=args.max_input_length,
+            )
         summary["load_seconds"] = round(time.time() - started, 1)
         import transformers
 
@@ -275,9 +486,6 @@ def main() -> int:
             chat_template_kwargs=chat_template_kwargs,
             log_samples=True,
             output_path=args.output_dir,
-        )
-        runner = _BatchedHfRunner(
-            model, tokenizer, batch_size=args.batch_size, max_prompt_tokens=args.max_input_length
         )
         sampling_params = SamplingParams(
             max_tokens=args.max_output_length,
@@ -296,8 +504,49 @@ def main() -> int:
         )
         summary["stop_string_hits"] = sum(1 for r in runner.completed_rows if r["stop_string_hit"])
         problems = []
-        if truncated:
-            problems.append(f"{len(truncated)} rows hit the {args.max_output_length}-token budget")
+        if args.replay_from:
+            regen_truncated = runner.regen_truncated_doc_ids()
+            undisclosed = [d for d in regen_truncated if d not in disclosed_runaways]
+            summary["replay"] = {
+                "source_samples": src_path,
+                "source_sha256": replay_source_sha,
+                "qualify_budget": args.replay_qualify_budget,
+                "at_budget_slack": AT_BUDGET_SLACK,
+                "replayed": len(runner.replayed_doc_ids),
+                "regenerated": len(runner.regen_doc_ids),
+                "regenerated_doc_ids": sorted(runner.regen_doc_ids),
+                "regen_truncated_doc_ids": regen_truncated,
+                "disclosed_runaway_doc_ids": disclosed_runaways,
+                "unserved_cache_rows": runner.unserved_cache_rows(),
+            }
+            if undisclosed:
+                problems.append(
+                    f"undisclosed regenerated rows hit the {args.max_output_length}-token "
+                    f"budget: {undisclosed}"
+                )
+            if runner.unserved_cache_rows():
+                problems.append(
+                    f"{runner.unserved_cache_rows()} sealed cache rows were never "
+                    "requested by the harness (matched-config drift)"
+                )
+        else:
+            # Native (non-replay) generation honors the SAME disclosed-runaway
+            # contract as the replay path (iteration-21 human override: a
+            # disclosed, pre-characterized native-HF runaway such as doc 786 is
+            # reported, not blocking; any OTHER truncation fails closed).
+            from glm5_next_lmeval_diff import load_samples
+
+            _, native_rows = load_samples(args.output_dir)
+            native_trunc = native_truncation_report(
+                native_rows, tokenizer, args.max_output_length, disclosed_runaways
+            )
+            native_trunc["row_index_truncation_count"] = len(truncated)
+            summary["native_truncation"] = native_trunc
+            if native_trunc["undisclosed_truncated_doc_ids"]:
+                problems.append(
+                    f"undisclosed rows hit the {args.max_output_length}-token "
+                    f"budget: {native_trunc['undisclosed_truncated_doc_ids']}"
+                )
         summary["problems"] = problems
         summary["ok"] = not problems
         print(

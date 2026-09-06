@@ -98,6 +98,7 @@ from glm5_next_driver_preflight import (  # noqa: E402  (script-dir import)
     disk_preflight,
     expected_graph_batch_sizes,
 )
+from glm5_next_llm_api_logit_replay import resolve_moe_parallel  # noqa: E402  (script-dir import)
 
 CAPTURE_MARK = "Running CUDA graph capture for"
 FALLBACK_MARKS = (
@@ -290,6 +291,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/dev/shm/GLM-5.3-Flash")
     parser.add_argument("--pp", type=int, default=8)
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="tensor_parallel_size; the Stage-6 TP4/EP4 smoke passes "
+        "--tp 4 --pp 1 --ep 4 (Mapping resolution mirrors the serve/replay "
+        "drivers via resolve_moe_parallel)",
+    )
+    parser.add_argument(
+        "--ep",
+        type=int,
+        default=None,
+        help="moe_expert_parallel_size; omit for TP-only MoE (moe_ep_size=1)",
+    )
     parser.add_argument("--config", choices=["B", "E"], default="B")
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -310,6 +325,12 @@ def main() -> int:
     )
     parser.add_argument("--summary", required=True)
     args = parser.parse_args()
+    try:
+        moe_tp, moe_ep, mapping_label, moe_llm_kwargs = resolve_moe_parallel(
+            args.tp, args.pp, args.ep
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     runlog = args.summary + ".runlog.txt"
     tee_output_to(runlog)
@@ -351,8 +372,12 @@ def main() -> int:
     summary = {
         "config": {
             "model": args.model,
-            "tensor_parallel_size": 1,
+            "tensor_parallel_size": args.tp,
             "pipeline_parallel_size": args.pp,
+            "world_size": args.tp * args.pp,
+            "moe_tensor_parallel_size": moe_tp,
+            "moe_expert_parallel_size": moe_ep,
+            "mapping_label": mapping_label,
             "configuration": args.config,
             "max_seq_len": args.max_seq_len,
             "max_batch_size": 4,
@@ -385,7 +410,7 @@ def main() -> int:
     try:
         llm = LLM(
             model=args.model,
-            tensor_parallel_size=1,
+            tensor_parallel_size=args.tp,
             pipeline_parallel_size=args.pp,
             max_seq_len=args.max_seq_len,
             max_batch_size=4,
@@ -395,6 +420,7 @@ def main() -> int:
             # is ON, so None must be explicit). E: overlap + CudaGraphConfig().
             disable_overlap_scheduler=not enabled,
             cuda_graph_config=graph_config,
+            **moe_llm_kwargs,
         )
         summary["phases"]["load_seconds"] = round(time.time() - started, 1)
         print(f"[smoke] engine up in {summary['phases']['load_seconds']}s", flush=True)
@@ -560,7 +586,10 @@ def main() -> int:
             enabled=enabled,
             expected_sizes=ladder_sizes,
             engine_max_batch_size=4,
-            pp_size=args.pp,
+            # Every MPI rank (tp*pp of them) logs its own [RANK k] capture
+            # line; the audit requires ALL of them to have captured the full
+            # ladder, so a single TP rank that silently decoded eager is caught.
+            pp_size=args.tp * args.pp,
         )
         summary["graph_ladder"] = ladder
         problems.extend(ladder_problems)
