@@ -422,12 +422,21 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         tables = getattr(mamba_metadata, "glm_block_tables", None)
         if tables is not None:
             # Persistent path: slices of prepare()-refreshed buffers. No
-            # allocation, no H2D, no host sync -- CUDA-graph safe.
+            # allocation, no H2D, no host sync -- CUDA-graph safe. Visible
+            # lengths prefer the metadata's device-corrected kv_lens_cuda
+            # (overlap scheduler + speculative decoding rewinds it in-graph;
+            # see modeling_glm5_next.glm5_next_visible_lens).
+            live = getattr(metadata, "kv_lens_cuda", None)
+            kv_lens = (
+                live[:batch].to(torch.long)
+                if live is not None
+                else mamba_metadata.glm_kv_lens[:batch]
+            )
             return _GlmKpoolCacheState(
                 latent_pool=latent,
                 index_pool=index,
                 block_tables=tables[:batch],
-                kv_lens=mamba_metadata.glm_kv_lens[:batch],
+                kv_lens=kv_lens,
                 tokens_per_block=tokens_per_block,
                 num_contexts=num_contexts,
             )
@@ -743,11 +752,18 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                     "from metadata; k must be None"
                 )
             gen_tables = state.block_tables[state.num_contexts :]
-            if gen_tables.shape[0] != q.shape[0]:
+            num_gens = gen_tables.shape[0]
+            if num_gens == 0 or q.shape[0] % num_gens:
                 raise ValueError(
                     f"glm_kpool generation forward got {q.shape[0]} query rows for "
-                    f"{gen_tables.shape[0]} generation requests in the metadata"
+                    f"{num_gens} generation requests in the metadata"
                 )
+            # Speculative verification packs ``1 + runtime_draft_len`` query
+            # rows per generation request, request-major; every row of a
+            # request resolves its selection through that request's table.
+            tokens_per_request = q.shape[0] // num_gens
+            if tokens_per_request > 1:
+                gen_tables = gen_tables.repeat_interleave(tokens_per_request, dim=0)
             kv_rows, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
             topk_rows = positions_to_pool_rows(
                 topk_indices, gen_tables, state.tokens_per_block, base_row, rows_per_slot

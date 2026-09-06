@@ -1,0 +1,11 @@
+# GLM-5.3-Flash + one-model MTP, config B (eager baseline: no CUDA graphs, no
+# overlap scheduling). Mirrors the sealed text-only config B with the
+# speculative section added; used with `trtllm-eval ... --extra_llm_api_options`.
+cuda_graph_config: null
+disable_overlap_scheduler: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.35
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 1

@@ -54,7 +54,8 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.rms_norm import RMSNorm
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, register_auto_model
 
 # ---------------------------------------------------------------------------
 # Literal schedule vocabulary
@@ -223,7 +224,7 @@ def _ignored_reason(key: str, mtp_prefixes: Sequence[str]) -> Optional[str]:
         return "vision tower is out of scope for the text bring-up"
     for prefix in mtp_prefixes:
         if key.startswith(prefix):
-            return "MTP / next-n prediction layer is out of scope"
+            return "MTP / next-n prediction layer is not enabled (no speculative_config)"
     return None
 
 
@@ -255,6 +256,8 @@ def remap_glm5_next_key(key: str) -> Optional[str]:
 def audit_glm5_next_checkpoint(
     keys: Iterable[str],
     config: PretrainedConfig,
+    *,
+    num_mtp_layers: int = 0,
 ) -> Glm5NextWeightAudit:
     """Resolve every checkpoint key to exactly one destination and disposition.
 
@@ -262,12 +265,27 @@ def audit_glm5_next_checkpoint(
     analytic -- it needs only the safetensors index and the config, not 328 GB
     of materialized weights -- so it can gate every later loading change
     cheaply.
+
+    ``num_mtp_layers`` is how many of the checkpoint's appended next-n
+    prediction (MTP) layers the model actually instantiates -- ``0`` for the
+    plain text model, ``1`` under one-model MTP speculative decoding. Those
+    layers' keys are placed on ``model.layers.{num_hidden_layers + i}.*``
+    (the alias the speculative base class appends the draft layers under);
+    any remaining MTP layer stays an allowlisted ignore.
     """
     text = get_glm5_next_text_config(config)
     num_layers = int(text.num_hidden_layers)
     num_nextn = int(getattr(text, "num_nextn_predict_layers", 0) or 0)
-    # MTP layers are appended immediately after the decoder stack.
-    mtp_prefixes = tuple(f"{_LANGUAGE_PREFIX}layers.{num_layers + i}." for i in range(num_nextn))
+    if num_mtp_layers < 0 or num_mtp_layers > num_nextn:
+        raise ValueError(
+            f"glm5_next cannot load {num_mtp_layers} MTP layers; the checkpoint "
+            f"declares num_nextn_predict_layers={num_nextn}"
+        )
+    # MTP layers are appended immediately after the decoder stack; the first
+    # ``num_mtp_layers`` of them are real destinations, the rest are ignored.
+    mtp_prefixes = tuple(
+        f"{_LANGUAGE_PREFIX}layers.{num_layers + i}." for i in range(num_mtp_layers, num_nextn)
+    )
 
     audit = Glm5NextWeightAudit()
     conv_sources: Dict[str, List[str]] = {}
@@ -650,6 +668,11 @@ def _normalize_glm5_next_top_config(config: PretrainedConfig) -> None:
         config.num_hidden_layers = int(text.num_hidden_layers)
     if getattr(config, "torch_dtype", None) is None:
         config.torch_dtype = getattr(text, "torch_dtype", None) or torch.bfloat16
+    # The one-model MTP drafter (``MTPForCausalLM``) reads the checkpoint's
+    # next-n layer count from the config it is handed, which is this top-level
+    # composite one; the field lives on ``text_config``.
+    if getattr(config, "num_nextn_predict_layers", None) is None:
+        config.num_nextn_predict_layers = int(getattr(text, "num_nextn_predict_layers", 0) or 0)
 
 
 @dataclass
@@ -681,6 +704,22 @@ class Glm5NextRuntimeContext:
     #: derived from; the sparse layers' attention backend consumes it as the
     #: single source of cache state.
     metadata: AttentionMetadata
+    #: Tokens per generation request in this step: ``1`` for plain decode,
+    #: ``1 + runtime_draft_len`` while a speculative-decoding target verifies
+    #: its draft tokens (the executor packs every generation request to the
+    #: same width, so this is one host int, fixed at CUDA-graph capture).
+    gen_tokens_per_request: int = 1
+
+    @property
+    def gen_phase(self) -> str:
+        """Which attention entry point the generation rows take.
+
+        ``"decode"`` is the sealed one-token path; ``"verify"`` is the
+        multi-token speculative verification path, whose recurrent-state
+        writes go to the hybrid manager's per-step intermediate buffers so the
+        sampler's acceptance decides what is committed.
+        """
+        return "decode" if self.gen_tokens_per_request == 1 else "verify"
 
     def linear_kwargs(self, layer_idx: int, phase: str) -> Dict[str, Any]:
         kwargs = {
@@ -695,7 +734,31 @@ class Glm5NextRuntimeContext:
             )
         else:
             kwargs.update(slot_ids=self.state_indices[self.num_contexts :])
+            if phase == "verify":
+                kwargs.update(
+                    tokens_per_request=self.gen_tokens_per_request,
+                    intermediate_conv=self.manager.get_intermediate_conv_states(layer_idx),
+                    intermediate_ssm=self.manager.get_intermediate_ssm_states(layer_idx),
+                    intermediate_rows=self.intermediate_rows(),
+                )
         return kwargs
+
+    def intermediate_rows(self) -> torch.Tensor:
+        """Batch-ordered rows of the hybrid manager's intermediate buffers.
+
+        The verification path writes request ``i``'s per-step states to row
+        ``i`` of the ``[spec_state_size, T, ...]`` scratch (generation rows
+        only), and ``update_mamba_states`` promotes the accepted step from
+        those same rows -- the manager's own ``intermediate_state_indices``
+        arange is the shared contract (the Mamba2/GDN mixers read it the
+        same way).
+        """
+        rows = getattr(self.manager, "intermediate_state_indices", None)
+        if rows is None:
+            rows = torch.arange(
+                self.num_generations, dtype=torch.int32, device=self.state_indices.device
+            )
+        return rows[: self.num_generations]
 
     def sparse_kwargs(self, layer_idx: int, phase: str) -> Dict[str, Any]:
         # Schedule only: the backend (keyed by its own layer_idx) derives the
@@ -710,11 +773,63 @@ class Glm5NextRuntimeContext:
             )
         else:
             kwargs.update(kv_lens=self.kv_lens[self.num_contexts :])
+            if phase == "verify":
+                kwargs.update(tokens_per_request=self.gen_tokens_per_request)
         return kwargs
+
+
+def _glm5_gen_tokens_per_request(attn_metadata: AttentionMetadata, num_generations: int) -> int:
+    """Tokens per generation request, from the metadata's host token counts.
+
+    Plain decode has one; a speculative-decoding target verifying drafts has
+    ``1 + runtime_draft_len``, uniformly across the generation rows (the
+    executor pads every drafted request to the same width). Derived from
+    host ints only, so it is a fixed shape parameter inside CUDA graphs.
+    """
+    if num_generations <= 0:
+        return 1
+    num_tokens = getattr(attn_metadata, "num_tokens", None)
+    if num_tokens is None:
+        # Harness carriers without the runtime's cached token count: the
+        # host seq_lens carry the same information (never a captured path).
+        num_tokens = int(attn_metadata.seq_lens.sum())
+    gen_tokens = int(num_tokens) - int(attn_metadata.num_ctx_tokens)
+    if gen_tokens <= 0 or gen_tokens % num_generations:
+        raise ValueError(
+            f"glm5_next: {gen_tokens} generation tokens do not split evenly over "
+            f"{num_generations} generation requests"
+        )
+    return gen_tokens // num_generations
+
+
+def glm5_next_visible_lens(attn_metadata: AttentionMetadata, batch: int) -> Optional[torch.Tensor]:
+    """Per-request visible lengths (``cached + this step's tokens``) as int64.
+
+    Prefers the attention metadata's own ``kv_lens_cuda`` over the
+    ``Glm5NextMamba2Metadata`` copy. Both hold the same values after
+    ``prepare()``, but only ``kv_lens_cuda`` receives the engine's in-graph
+    corrections: under the overlap scheduler with speculative decoding the
+    host prepares generation requests as if every draft of the previous step
+    had been accepted, and ``_preprocess_inputs`` subtracts the rejected
+    count on device (``previous_kv_lens_offsets_cuda``) right before the
+    forward; the speculative worker likewise rewinds it between draft steps.
+    Reading the host-derived copy there positions the new latent/indexer rows
+    past the real prefix and attends stale page contents -- observed as
+    non-deterministic MTP output under config E. Returns ``None`` when the
+    metadata carries no ``kv_lens_cuda`` (harness carriers), so callers fall
+    back to the GLM buffer. The int32 -> int64 cast is a device op with no
+    host sync, so it is legal inside CUDA-graph capture.
+    """
+    live = getattr(attn_metadata, "kv_lens_cuda", None)
+    if live is None:
+        return None
+    return live[:batch].to(torch.long)
 
 
 def build_glm5_next_runtime_context(
     attn_metadata: AttentionMetadata,
+    *,
+    kv_lens_source: str = "glm",
 ) -> Glm5NextRuntimeContext:
     """Derive the per-forward cache arguments from prepared metadata.
 
@@ -724,6 +839,15 @@ def build_glm5_next_runtime_context(
     own convention -- tokens already in the cache, excluding the ones in this
     step -- which is exactly what ``forward_prefill``/``forward_decode`` seed
     and position from.
+
+    Visible lengths come from :func:`glm5_next_visible_lens` (the metadata's
+    device-corrected ``kv_lens_cuda``) whenever the metadata carries it, for
+    both the target and the MTP draft layer; the ``Glm5NextMamba2Metadata``
+    copy is the fallback for harness carriers. ``kv_lens_source`` is kept for
+    call-site documentation (``"metadata"`` marks the draft layer, whose
+    lengths the speculative worker rewinds in place between draft steps) and
+    to reject unknown values; it no longer changes the source when
+    ``kv_lens_cuda`` is present.
     """
     manager = attn_metadata.kv_cache_manager
     if manager is None:
@@ -734,24 +858,37 @@ def build_glm5_next_runtime_context(
             "glm5_next requires mamba_metadata; call attn_metadata.prepare() "
             "with the Glm5NextCacheManager attached"
         )
+    if kv_lens_source not in ("glm", "metadata"):
+        raise ValueError(f"glm5_next: unknown kv_lens_source {kv_lens_source!r}")
     batch = int(attn_metadata.seq_lens.shape[0])
     num_contexts = int(attn_metadata.num_contexts)
+    num_generations = batch - num_contexts
+    gen_tokens_per_request = _glm5_gen_tokens_per_request(attn_metadata, num_generations)
 
     if getattr(mamba_metadata, "glm_block_tables", None) is not None:
         # Persistent path: every tensor below is a prepare()-refreshed buffer
         # slice, so this function does no allocation, no H2D, and no host
         # sync -- it is safe to run inside CUDA graph capture, and replays
         # read the refreshed values at the same addresses.
+        kv_lens = glm5_next_visible_lens(attn_metadata, batch)
+        if kv_lens is None:
+            if kv_lens_source == "metadata":
+                raise ValueError(
+                    "glm5_next draft layer needs attn_metadata.kv_lens_cuda (the "
+                    "TRTLLM metadata family); the attached metadata has none"
+                )
+            kv_lens = mamba_metadata.glm_kv_lens[:batch]
         return Glm5NextRuntimeContext(
             manager=manager,
             num_contexts=num_contexts,
             num_ctx_tokens=int(attn_metadata.num_ctx_tokens),
-            num_generations=batch - num_contexts,
+            num_generations=num_generations,
             ctx_cu_seqlens=mamba_metadata.glm_ctx_cu_seqlens,
             cached_lens=mamba_metadata.glm_cached_lens_host,
             state_indices=mamba_metadata.state_indices[:batch],
-            kv_lens=mamba_metadata.glm_kv_lens[:batch],
+            kv_lens=kv_lens,
             metadata=attn_metadata,
+            gen_tokens_per_request=gen_tokens_per_request,
         )
 
     # Legacy eager construction, kept for harnesses whose fake managers do
@@ -779,21 +916,26 @@ def build_glm5_next_runtime_context(
         [c + n for c, n in zip(cached_lens, lens)], dtype=torch.long, device=device
     )
 
+    live = glm5_next_visible_lens(attn_metadata, batch)
+    if live is not None:
+        kv_lens = live
+
     return Glm5NextRuntimeContext(
         manager=manager,
         num_contexts=num_contexts,
         num_ctx_tokens=int(attn_metadata.num_ctx_tokens),
-        num_generations=batch - num_contexts,
+        num_generations=num_generations,
         ctx_cu_seqlens=ctx_cu,
         cached_lens=cached_lens,
         state_indices=mamba_metadata.state_indices[:batch],
         kv_lens=kv_lens,
         metadata=attn_metadata,
+        gen_tokens_per_request=gen_tokens_per_request,
     )
 
 
 @register_auto_model("Glm5NextForConditionalGeneration")
-class Glm5NextForCausalLM(DecoderModelForCausalLM):
+class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
     """Text-path entry point for GLM-5.3-Flash.
 
     Auto-discovery resolves the published architecture
@@ -802,15 +944,25 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
     scope and its weights are allowlisted rather than loaded (see
     :func:`audit_glm5_next_checkpoint`).
 
-    The class inherits the ``DecoderModelForCausalLM`` lifecycle wholesale --
-    ``PostInitCaller`` construction, ``LMHead``/``LogitsProcessor``, the
-    runtime ``forward(attn_metadata, ...)``, and pipeline-parallel prologue/
-    epilogue handling -- and keeps only what is GLM-specific: the config
-    narrowing, the literal dispatch schedule, the audited block-FP8 quant
-    plan, and the checkpoint's exact-placement loader.
+    The class inherits the ``SpecDecOneEngineForCausalLM`` lifecycle
+    wholesale (a ``DecoderModelForCausalLM`` that also hosts one-model
+    speculative decoding) -- ``PostInitCaller`` construction,
+    ``LMHead``/``LogitsProcessor``, the runtime ``forward(attn_metadata,
+    ...)``, pipeline-parallel prologue/epilogue handling, and, when
+    ``model_config.spec_config`` selects one-model MTP, the draft-layer
+    factory plus the speculative worker that samples, verifies, and drafts
+    -- and keeps only what is GLM-specific: the config narrowing, the
+    literal dispatch schedule, the audited block-FP8 quant plan, and the
+    checkpoint's exact-placement loader. Without a ``spec_config`` the base
+    class is inert and the model is byte-for-byte the sealed text model.
+
+    Under MTP the draft layer (:class:`Glm5NextMTP`, ``layers.45``) is
+    appended to ``self.model.layers`` exactly as Qwen3-Next does, so its
+    checkpoint keys resolve by name through the same loader; the decoder
+    forward still runs only the 45 main layers.
 
     The base class is deliberately unsubscripted: the generic form
-    ``DecoderModelForCausalLM[Glm5NextModel, ...]`` would evaluate
+    ``SpecDecOneEngineForCausalLM[Glm5NextModel, ...]`` would evaluate
     ``Glm5NextModel`` at class-definition time, before it is defined below.
 
     Instantiating this materializes all 45 layers including 288 routed
@@ -830,7 +982,7 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
         _normalize_glm5_next_top_config(model_config.pretrained_config)
         super().__init__(
             Glm5NextModel(model_config),
-            config=model_config,
+            model_config,
             hidden_size=int(text_config.hidden_size),
             vocab_size=int(text_config.vocab_size),
         )
@@ -838,6 +990,22 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
         # the narrowed decoder contract lives here.
         self.text_config = text_config
         self.schedule = resolve_glm5_next_schedule(model_config.pretrained_config)
+        # One-model MTP: the base class built ``draft_model.mtp_layers`` (one
+        # Glm5NextMTP at layer_idx 45) and the speculative worker. Alias the
+        # draft layer(s) onto ``model.layers[45:]`` so the checkpoint's
+        # ``model.layers.45.*`` keys are placed by the same exact loader, the
+        # same projection swap, and the same per-owner materialization.
+        self.mtp_layers: Tuple[nn.Module, ...] = ()
+        spec_config = getattr(model_config, "spec_config", None)
+        if spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model():
+            mtp_layers = tuple(self.draft_model.mtp_layers)
+            if len(mtp_layers) != 1:
+                raise ValueError(
+                    f"glm5_next builds exactly one MTP layer (num_nextn_predict_layers=1); "
+                    f"the drafter constructed {len(mtp_layers)}"
+                )
+            self.model.layers.extend(mtp_layers)
+            self.mtp_layers = mtp_layers
         self.quant_config = build_glm5_next_quant_config(model_config.pretrained_config)
         # Derived from the ModelConfig, never a constructor flag: the runtime's
         # AutoModelForCausalLM.from_config calls cls(model_config) and nothing
@@ -863,7 +1031,8 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
         logger.info(
             f"glm5_next runtime stack: sparse_attention={attn_backends}, "
             f"moe_backend={moe_backends}, quantized={self.quantized}, "
-            f"kv_cache_manager=V2 (Glm5NextCacheManager)"
+            f"kv_cache_manager=V2 (Glm5NextCacheManager), "
+            f"mtp_layers={len(self.mtp_layers)}"
         )
 
     @property
@@ -910,7 +1079,9 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
 
     def audit_checkpoint(self, keys: Iterable[str]) -> Glm5NextWeightAudit:
         """Resolve every checkpoint key against this model's destinations."""
-        return audit_glm5_next_checkpoint(keys, self.model_config.pretrained_config)
+        return audit_glm5_next_checkpoint(
+            keys, self.model_config.pretrained_config, num_mtp_layers=len(self.mtp_layers)
+        )
 
     # -- whole-model materialization --------------------------------------
 
@@ -977,9 +1148,11 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
         if not getattr(self, "_quant_plan_applied", False):
             self.apply_quant_plan(list(weights.keys()))
         report = report or Glm5NextLoadReport()
-        pretrained = self.model_config.pretrained_config
-        num_layers = self.schedule.num_layers
-        audit = audit_glm5_next_checkpoint(list(weights.keys()), pretrained)
+        # Decoder stack plus the aliased MTP draft layer(s), if any: owners
+        # ``45..`` are the draft layers, placed from the checkpoint's own
+        # ``layers.45.*`` keys instead of being allowlisted away.
+        num_layers = self.schedule.num_layers + len(self.mtp_layers)
+        audit = self.audit_checkpoint(list(weights.keys()))
 
         # Each owner is materialized and filled on its own, so peak memory is
         # one layer above the final footprint rather than a second full copy.
@@ -1617,6 +1790,95 @@ def _kda_decode_step_kernel(
     tl.store(OUT + b * out_row_stride + h * out_head_stride + dv, out)
 
 
+@triton.jit
+def _kda_verify_step_kernel(
+    CONV,
+    G,
+    BETA,
+    A_LOG,
+    DTB,
+    SLOTS,
+    ROWS,
+    STATE,
+    ISTATE,
+    OUT,
+    conv_row_stride,
+    state_slot_stride,
+    state_head_stride,
+    state_v_stride,
+    istate_row_stride,
+    istate_step_stride,
+    istate_head_stride,
+    istate_v_stride,
+    out_row_stride,
+    out_head_stride,
+    scale,
+    lower_bound,
+    l2_eps,
+    QKV: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BV: tl.constexpr,
+    T: tl.constexpr,
+):
+    """``T`` sequential KDA steps per request for speculative verification.
+
+    Same per-step math as :func:`_kda_decode_step_kernel`, run ``T`` times
+    for request ``b``'s tokens ``b*T .. b*T+T-1`` (the executor's packed
+    generation layout). The live state row is **read only**: the state after
+    each step ``j`` is written to the hybrid manager's intermediate buffer at
+    ``ISTATE[ROWS[b], j]`` instead, and ``update_mamba_states`` later promotes
+    the step the sampler accepted into the live pool. Committing in place here
+    would advance the recurrence past rejected drafts with no way back.
+
+    No host value is read and every shape is a constexpr, so a captured
+    graph replays against refreshed slot/row buffers.
+    """
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    vb = tl.program_id(2)
+    dk = tl.arange(0, K)
+    dv = vb * BV + tl.arange(0, BV)
+
+    bias = tl.load(DTB + h * K + dk)
+    decay_rate = tl.exp(tl.load(A_LOG + h))
+
+    slot = tl.load(SLOTS + b).to(tl.int64)
+    row = tl.load(ROWS + b).to(tl.int64)
+    state_ptr = (
+        STATE + slot * state_slot_stride + h * state_head_stride + dv[:, None] * state_v_stride
+    ) + dk[None, :]
+    state = tl.load(state_ptr)
+
+    for j in tl.static_range(T):
+        tok = b * T + j
+        base = tok * conv_row_stride + h * K
+        q = tl.load(CONV + base + dk).to(tl.float32)
+        k = tl.load(CONV + base + QKV + dk).to(tl.float32)
+        v = tl.load(CONV + base + 2 * QKV + dv).to(tl.float32)
+        g = tl.load(G + tok * (H * K) + h * K + dk).to(tl.float32)
+        gate = lower_bound * tl.sigmoid(decay_rate * (g + bias))
+
+        q = q / tl.sqrt(tl.sum(q * q) + l2_eps) * scale
+        k = k / tl.sqrt(tl.sum(k * k) + l2_eps)
+        beta = tl.sigmoid(tl.load(BETA + tok * H + h).to(tl.float32))
+
+        state = state * tl.exp(gate)[None, :]
+        recalled = tl.sum(state * k[None, :], axis=1)
+        delta = (v - recalled) * beta
+        state = state + k[None, :] * delta[:, None]
+        out = tl.sum(state * q[None, :], axis=1)
+        tl.store(OUT + tok * out_row_stride + h * out_head_stride + dv, out)
+        istate_ptr = (
+            ISTATE
+            + row * istate_row_stride
+            + j * istate_step_stride
+            + h * istate_head_stride
+            + dv[:, None] * istate_v_stride
+        ) + dk[None, :]
+        tl.store(istate_ptr, state)
+
+
 # One-shot (per process) KDA dispatch provenance. Engine-scale runs need the
 # actually-dispatched kernel path — construction alone cannot prove it — and
 # worker logs are the only channel from an MPI rank to the LLM API driver.
@@ -2016,6 +2278,117 @@ class Glm5NextLinearAttention(nn.Module):
             H=self.num_heads,
             K=self.head_dim,
             BV=_KDA_DECODE_BV,
+            num_warps=4,
+        )
+        return self._finish(core.to(hidden_states.dtype), hidden_states)
+
+    def forward_verify(
+        self,
+        hidden_states: torch.Tensor,
+        slot_ids: torch.Tensor,
+        conv_pool: torch.Tensor,
+        ssm_pool: torch.Tensor,
+        tokens_per_request: int,
+        intermediate_conv: Optional[torch.Tensor],
+        intermediate_ssm: Optional[torch.Tensor],
+        intermediate_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Speculative verification: ``tokens_per_request`` tokens per request.
+
+        The target model of one-model MTP receives, per generation request, the
+        golden token plus ``runtime_draft_len`` drafts, packed request-major.
+        The recurrence must run through all of them to score them, but only
+        the accepted prefix may become the request's state. So neither pool is
+        committed here: the multi-token convolution writes each step's window
+        to the hybrid manager's ``intermediate_conv`` scratch (the same
+        ``causal_conv1d_update`` Triton path the Mamba2/GDN mixers use for
+        this), and the fused verify step writes each step's fp32 recurrent
+        state to ``intermediate_ssm``, both at the batch-ordered
+        ``intermediate_rows``. After acceptance the speculative worker calls
+        ``update_mamba_states``, which copies the accepted step's window and
+        state from those rows into the live pools -- the manager's own
+        promotion contract, not a model-side copy.
+
+        Shapes are functions of ``tokens_per_request`` and the buffer
+        geometry only, and no host value is read, so this is capture-safe.
+        """
+        tokens_per_request = int(tokens_per_request)
+        if tokens_per_request <= 1:
+            return self.forward_decode(hidden_states, slot_ids, conv_pool, ssm_pool)
+        if intermediate_conv is None or intermediate_ssm is None:
+            raise ValueError(
+                "glm5_next KDA verification needs the hybrid manager's intermediate "
+                "conv/ssm buffers (allocated when spec_config is set); got None"
+            )
+        if ssm_pool.stride(-1) != 1 or intermediate_ssm.stride(-1) != 1:
+            raise ValueError("glm5_next KDA verify needs K-contiguous recurrent state buffers")
+        from ..modules.mamba.causal_conv1d_triton import (
+            causal_conv1d_update as causal_conv1d_update_multi_token,
+        )
+
+        num_tokens = hidden_states.shape[0]
+        batch = num_tokens // tokens_per_request
+        if batch * tokens_per_request != num_tokens or slot_ids.shape[0] != batch:
+            raise ValueError(
+                f"glm5_next KDA verify: {num_tokens} tokens for {slot_ids.shape[0]} requests "
+                f"at {tokens_per_request} tokens per request"
+            )
+        _log_kda_dispatch_once(
+            "verify=triton::causal_conv1d_update(multi-token)+triton_kda_verify_step",
+            self.layer_idx,
+        )
+        device = conv_pool.device
+        rows = intermediate_rows.to(device=device, dtype=torch.int32).contiguous()
+
+        # [B*T, 3D] -> [B, 3D, T]: the executor's packed request-major tokens
+        # viewed as one short sequence per request for the convolution.
+        projected = self._project(hidden_states).view(batch, tokens_per_request, self.conv_dim)
+        conv_out = causal_conv1d_update_multi_token(
+            projected.transpose(1, 2),
+            conv_pool,
+            self.conv1d.weight.squeeze(1),
+            None,
+            activation="silu",
+            conv_state_indices=slot_ids.to(device=device, dtype=torch.int32),
+            intermediate_conv_window=intermediate_conv,
+            intermediate_state_indices=rows,
+        )
+        conv_out = conv_out.transpose(1, 2).reshape(num_tokens, self.conv_dim).contiguous()
+
+        g_raw = self.f_b_proj(self.f_a_proj(hidden_states)).contiguous()
+        beta_raw = self.b_proj(hidden_states).contiguous()
+        core = torch.empty(
+            num_tokens, self.num_heads, self.head_dim, dtype=torch.float32, device=device
+        )
+        _kda_verify_step_kernel[(batch, self.num_heads, self.head_dim // _KDA_DECODE_BV)](
+            conv_out,
+            g_raw,
+            beta_raw,
+            self.A_log,
+            self.dt_bias,
+            slot_ids.to(device=device, dtype=torch.long).contiguous(),
+            rows.to(torch.long).contiguous(),
+            ssm_pool,
+            intermediate_ssm,
+            core,
+            conv_out.stride(0),
+            ssm_pool.stride(0),
+            ssm_pool.stride(1),
+            ssm_pool.stride(2),
+            intermediate_ssm.stride(0),
+            intermediate_ssm.stride(1),
+            intermediate_ssm.stride(2),
+            intermediate_ssm.stride(3),
+            core.stride(0),
+            core.stride(1),
+            self.head_dim**-0.5,
+            self.gate_lower_bound,
+            1e-6,
+            QKV=self.qkv_dim,
+            H=self.num_heads,
+            K=self.head_dim,
+            BV=_KDA_DECODE_BV,
+            T=tokens_per_request,
             num_warps=4,
         )
         return self._finish(core.to(hidden_states.dtype), hidden_states)
@@ -2612,6 +2985,81 @@ class Glm5NextSparseAttention(nn.Module):
             q_resid, hidden_states, pool_keys, pool_last, pool_valid, token_request, kv_lens - 1
         )
         _glm5_pool_probe(self.layer_idx, topk, kv_lens)
+        q_latent = self.absorb_query(query)
+        out_latent = self.attn_backend.forward(
+            q_latent,
+            None,
+            None,
+            metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.generation_only,
+                sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk),
+            ),
+        )
+        return self.project_output_latent(out_latent)
+
+    def forward_verify(
+        self,
+        hidden_states: torch.Tensor,
+        kv_lens: torch.Tensor,
+        metadata: AttentionMetadata,
+        tokens_per_request: int,
+    ) -> torch.Tensor:
+        """Generation phase with ``tokens_per_request`` tokens per request.
+
+        The speculative-decoding target scores the golden token plus the
+        drafts in one pass; the MTP draft layer's first step sees the same
+        packed layout. Request ``i``'s tokens sit at cache positions
+        ``kv_lens[i] - T .. kv_lens[i] - 1`` (``kv_lens`` already counts them,
+        exactly as in :meth:`forward_decode`), so the latent/indexer rows are
+        appended there and every query is scored against its *own* visible
+        prefix: :meth:`Glm5NextIndexer.select` masks pools whose last member
+        lies beyond the query's position and builds the tail from the query's
+        own position, so token ``j`` never sees tokens ``j+1..``. Rows written
+        for drafts that are later rejected are simply overwritten by the next
+        step, which re-appends at the rewound ``kv_lens`` -- the same
+        positional-cache convention MLA relies on.
+
+        Every shape is a function of ``tokens_per_request`` and the buffer
+        geometry, with no host sync, so a captured verification graph replays
+        against refreshed lengths and tables.
+        """
+        tokens_per_request = int(tokens_per_request)
+        if tokens_per_request <= 1:
+            return self.forward_decode(hidden_states, kv_lens, metadata)
+        num_tokens = hidden_states.shape[0]
+        batch = num_tokens // tokens_per_request
+        if batch * tokens_per_request != num_tokens or kv_lens.shape[0] != batch:
+            raise ValueError(
+                f"glm5_next sparse verify: {num_tokens} tokens for {kv_lens.shape[0]} requests "
+                f"at {tokens_per_request} tokens per request"
+            )
+        device = hidden_states.device
+        steps = torch.arange(tokens_per_request, device=device)
+        positions = (kv_lens - tokens_per_request).unsqueeze(1) + steps  # [B, T]
+        self.attn_backend.append_paged_state(
+            self.project_latent(hidden_states).view(batch, tokens_per_request, -1),
+            self.indexer.packed_state(hidden_states).view(batch, tokens_per_request, -1),
+            positions,
+            metadata,
+        )
+        packed_prefix, num_pools = self.attn_backend.gather_packed_prefix(metadata)
+        pool_keys, pool_last, pool_valid = self.indexer.build_pools(
+            packed_prefix, kv_lens, num_pools
+        )
+        q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        query = self.q_b_proj(q_resid).view(num_tokens, self.num_heads, self.qk_head_dim)
+        token_request = torch.arange(batch, device=device).repeat_interleave(tokens_per_request)
+        topk = self.indexer.select(
+            q_resid,
+            hidden_states,
+            pool_keys,
+            pool_last,
+            pool_valid,
+            token_request,
+            positions.reshape(-1),
+        )
+        _glm5_pool_probe(self.layer_idx, topk, kv_lens.repeat_interleave(tokens_per_request))
         q_latent = self.absorb_query(query)
         out_latent = self.attn_backend.forward(
             q_latent,
@@ -3481,7 +3929,7 @@ class Glm5NextMoE(nn.Module):
                 return routed.view_as(x) + self.shared_experts(x)
             return routed.view_as(x) + self.shared_experts(x)
         _, topk_weights, topk_indices = self.gate(flat)
-        if phase == "decode":
+        if phase in ("decode", "verify"):
             routed = self._routed_decode(flat, topk_weights, topk_indices)
         else:
             routed = self._routed_prefill(flat, topk_weights, topk_indices)
@@ -3719,11 +4167,14 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 )
             )
         if runtime_ctx.num_generations > 0:
+            # "decode" (one token per request) or "verify" (golden + drafts
+            # per request while a speculative-decoding target scores them).
+            phase = runtime_ctx.gen_phase
             parts.append(
                 self.forward_direct(
                     hidden_states[runtime_ctx.num_ctx_tokens :],
-                    phase="decode",
-                    **derive(self.layer_idx, "decode"),
+                    phase=phase,
+                    **derive(self.layer_idx, phase),
                 )
             )
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
@@ -3803,6 +4254,10 @@ class Glm5NextModel(DecoderModel):
         self.norm = RMSNorm(
             hidden_size=int(config.hidden_size), eps=float(config.rms_norm_eps), dtype=dtype
         )
+        # Read by the one-model MTP drafter factory (``MTPForCausalLM`` passes
+        # ``model.aux_stream_dict`` to every MTP layer). This model runs its
+        # branches on the main stream, so the draft layer receives an empty map.
+        self.aux_stream_dict: Dict[Any, Any] = {}
 
     def forward(
         self,
@@ -3827,8 +4282,12 @@ class Glm5NextModel(DecoderModel):
         streams = self.expand_streams(inputs_embeds)
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
-        for layer in self.layers:
-            streams = layer(
+        # Only the decoder stack: under one-model MTP the speculative base
+        # class appends the draft layer(s) to ``self.layers`` (so the
+        # checkpoint's ``model.layers.45.*`` names resolve), and those run in
+        # the speculative worker's draft loop, not here.
+        for layer_idx in range(self.schedule.num_layers):
+            streams = self.layers[layer_idx](
                 position_ids=position_ids,
                 hidden_states=streams,
                 attn_metadata=attn_metadata,
@@ -3843,6 +4302,215 @@ class Glm5NextModel(DecoderModel):
     def collapse_streams(self, hidden_streams: torch.Tensor) -> torch.Tensor:
         """Unweighted stream mean followed by the final RMS norm."""
         return self.norm(glm5_next_hyper_head(hidden_streams))
+
+
+# ---------------------------------------------------------------------------
+# Multi-token prediction (one-model MTP speculative decoding)
+# ---------------------------------------------------------------------------
+
+
+class Glm5NextMTPHead(nn.Module):
+    """The MTP layer's ``shared_head``: its final norm plus the draft logits.
+
+    ``norm`` is applied by :class:`Glm5NextMTP` at the end of its forward (the
+    checkpoint's ``shared_head.norm``); ``forward`` here turns the resulting
+    hidden states into logits through the *target's* ``lm_head`` -- the
+    checkpoint publishes no separate MTP head weight -- the way the
+    speculative worker calls it: ``shared_head(hidden, lm_head, attn_metadata,
+    return_context_logits)``. The LM-head TP handling mirrors the DeepSeek-V3
+    MTP head exactly, because the worker's greedy draft sampler recovers the
+    global argmax from vocab-sharded logits (``is_spec_decoding_head``).
+    """
+
+    def __init__(self, config: PretrainedConfig, model_config: ModelConfig, dtype: torch.dtype):
+        super().__init__()
+        self.model_config = model_config
+        self.norm = RMSNorm(
+            hidden_size=int(config.hidden_size), eps=float(config.rms_norm_eps), dtype=dtype
+        )
+        self.mapping_lm_head_tp = None
+
+    @staticmethod
+    def get_last_token_states(hidden_states: torch.Tensor, attn_metadata) -> torch.Tensor:
+        last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        return hidden_states[last_tokens]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: nn.Module,
+        attn_metadata,
+        return_context_logits: bool = False,
+    ) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = self.get_last_token_states(hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
+
+        mapping = self.model_config.mapping
+        enable_attention_dp = bool(mapping.enable_attention_dp)
+        enable_lm_head_tp_in_adp = enable_attention_dp and bool(
+            getattr(mapping, "enable_lm_head_tp_in_adp", False)
+        )
+        if enable_lm_head_tp_in_adp:
+            from ..distributed import allgather
+            from ..utils import create_lm_head_tp_mapping
+
+            self.mapping_lm_head_tp = create_lm_head_tp_mapping(mapping, hidden_states.shape[0])
+            hidden_states = allgather(hidden_states, self.mapping_lm_head_tp, dim=0)
+
+        # Vocab-sharded logits for the spec worker's TP-aware greedy argmax,
+        # restored afterwards so the target's own logits path is unchanged.
+        toggle_gather = not enable_attention_dp or enable_lm_head_tp_in_adp
+        if toggle_gather:
+            lm_head.gather_output = False
+        logits = lm_head(
+            hidden_states, mapping_lm_head_tp=self.mapping_lm_head_tp, is_spec_decoding_head=True
+        )
+        if toggle_gather:
+            lm_head.gather_output = True
+        return logits
+
+
+class Glm5NextMTP(nn.Module):
+    """GLM-5.3-Flash's one next-token-prediction layer (``layers.45``).
+
+    Structure, verified against the checkpoint's own keys and the vLLM GLM-5
+    port (``glm5next/nvidia/mtp.py``) since the HF reference implements no
+    MTP: ``enorm(embed(next_token)) ++ hnorm(target_hidden) -> eh_proj`` into
+    a **plain-residual** decoder block -- the MTP layer has no
+    hyper-connection weights, unlike the 45 main layers -- made of the same
+    sparse-MLA + k-pool indexer attention and 288+1-expert MoE as the main
+    sparse layers, closed by ``shared_head.norm``. The attention and MoE are
+    the *same classes* as the main stack (with ``layer_idx = 45``), so the
+    draft layer owns its own latent/indexer pages in the one hybrid cache
+    manager (the executor appends one attention layer for it) and shares the
+    projection-swap, TP-shard, and exact-placement loading contracts.
+
+    Constructed by :class:`~.modeling_speculative.MTPForCausalLM` through
+    the model-type dispatch and called by the one-model speculative worker
+    as ``mtp_layer(input_ids, position_ids, hidden_states, embed_tokens,
+    attn_metadata, all_rank_num_tokens, spec_metadata)``. ``hidden_states``
+    are the target's post-final-norm states for the same packed tokens (the
+    convention the DeepSeek-V3/Qwen3-Next/vLLM MTP paths all use), and the
+    first draft step's token schedule is *identical* to the target
+    verification pass (contexts: prompt shifted by one; generation:
+    ``1 + runtime_draft_len`` accepted/padded tokens at the same positions),
+    so it reuses the target's runtime-context derivation, reading the
+    metadata's live ``kv_lens_cuda`` so later draft steps' rewinds are seen.
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: int,
+        aux_stream_dict: Any = None,
+        is_separate_draft_engine: bool = False,
+    ):
+        super().__init__()
+        del aux_stream_dict  # single-stream model; accepted for the factory's call shape
+        if is_separate_draft_engine:
+            raise NotImplementedError(
+                "glm5_next MTP runs one-model speculative decoding only (MTP / MTP_EAGLE_ONE_MODEL)"
+            )
+        _normalize_glm5_next_top_config(model_config.pretrained_config)
+        config = get_glm5_next_text_config(model_config.pretrained_config)
+        schedule = resolve_glm5_next_schedule(model_config.pretrained_config)
+        num_nextn = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+        if not (schedule.num_layers <= layer_idx < schedule.num_layers + num_nextn):
+            raise ValueError(
+                f"glm5_next MTP layer index {layer_idx} is outside the checkpoint's appended "
+                f"range [{schedule.num_layers}, {schedule.num_layers + num_nextn})"
+            )
+        dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
+        hidden = int(config.hidden_size)
+        eps = float(config.rms_norm_eps)
+        self.model_config = model_config
+        self.layer_idx = layer_idx
+        self.attention_type = SPARSE_ATTENTION
+        self.mlp_type = SPARSE_MLP
+
+        self.enorm = RMSNorm(hidden_size=hidden, eps=eps, dtype=dtype)
+        self.hnorm = RMSNorm(hidden_size=hidden, eps=eps, dtype=dtype)
+        # Raw at the full geometry; the projection swap installs the
+        # row-parallel Linear (input chunked per rank, one reduction) that
+        # :func:`resolve_glm5_next_projection_spec` declares for ``.eh_proj``.
+        self.eh_proj = nn.Linear(2 * hidden, hidden, bias=False, dtype=dtype)
+        self.input_layernorm = RMSNorm(hidden_size=hidden, eps=eps, dtype=dtype)
+        self.post_attention_layernorm = RMSNorm(hidden_size=hidden, eps=eps, dtype=dtype)
+        self.self_attn = Glm5NextSparseAttention(
+            config,
+            layer_idx,
+            dtype=dtype,
+            attn_backend=model_config.attn_backend,
+            mapping=model_config.mapping,
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+        self.mlp = Glm5NextMoE(
+            config,
+            dtype=dtype,
+            quantized=glm5_next_is_quantized(model_config),
+            model_config=model_config,
+            layer_idx=layer_idx,
+        )
+        self.shared_head = Glm5NextMTPHead(config, model_config, dtype)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        embed_tokens: nn.Module,
+        attn_metadata: AttentionMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del position_ids, all_rank_num_tokens, kwargs  # NoPE; single-stream MoE reads no ADP counts
+        inputs_embeds = self.enorm(embed_tokens(input_ids))
+        hidden_states = self.hnorm(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        mapping = self.model_config.mapping
+        if mapping.tp_size > 1 and not mapping.enable_attention_dp:
+            # Row-parallel eh_proj: each rank consumes its own input chunk.
+            hidden_states = torch.chunk(hidden_states, mapping.tp_size, dim=-1)[mapping.tp_rank]
+        hidden_states = self.eh_proj(hidden_states)
+
+        runtime_ctx = build_glm5_next_runtime_context(attn_metadata, kv_lens_source="metadata")
+        residual = hidden_states
+        attn_in = self.input_layernorm(hidden_states)
+        parts = []
+        if runtime_ctx.num_contexts > 0:
+            parts.append(
+                self.self_attn.forward_prefill(
+                    attn_in[: runtime_ctx.num_ctx_tokens],
+                    **runtime_ctx.sparse_kwargs(self.layer_idx, "prefill"),
+                )
+            )
+        if runtime_ctx.num_generations > 0:
+            phase = runtime_ctx.gen_phase
+            parts.append(
+                getattr(self.self_attn, f"forward_{phase}")(
+                    attn_in[runtime_ctx.num_ctx_tokens :],
+                    **runtime_ctx.sparse_kwargs(self.layer_idx, phase),
+                )
+            )
+        attn_out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        hidden_states = residual + attn_out
+
+        residual = hidden_states
+        # The production MoE is phase-free; the diagnostic path takes the
+        # capture-safe static dispatch whenever no context request is present.
+        mlp_phase = "prefill" if runtime_ctx.num_contexts > 0 else runtime_ctx.gen_phase
+        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states), phase=mlp_phase)
+        hidden_states = residual + hidden_states
+
+        hidden_states = self.shared_head.norm(hidden_states)
+        if spec_metadata is not None:
+            # Two-model-path hook kept for parity with the DeepSeek-V3 MTP layer.
+            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -3951,6 +4619,9 @@ _GLM5_TP_SPECS: Tuple[Tuple[str, Glm5NextTpSpec], ...] = (
     (".self_attn.indexer.wq_b", Glm5NextTpSpec("column")),
     (".self_attn.indexer.weights_proj", Glm5NextTpSpec("column")),
     (".self_attn.indexer.wk", Glm5NextTpSpec(None)),
+    # MTP layer: the [embed | hidden] -> hidden fusion consumes each rank's
+    # input chunk (DeepSeek-V3 MTP ownership) with one in-Linear reduction.
+    (".eh_proj", Glm5NextTpSpec("row")),
     # Dense MLP (and, in the TP4 layout, the shared expert -- see resolver).
     (".mlp.gate_proj", Glm5NextTpSpec("column")),
     (".mlp.up_proj", Glm5NextTpSpec("column")),

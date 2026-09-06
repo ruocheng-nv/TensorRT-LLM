@@ -1,0 +1,11 @@
+# GLM-5.3-Flash + one-model MTP, config E (CudaGraphConfig() + overlap
+# scheduler): the deployment configuration. Mirrors the sealed text-only
+# config-E full-run YAML with the speculative section added.
+cuda_graph_config: {}
+disable_overlap_scheduler: false
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 1
