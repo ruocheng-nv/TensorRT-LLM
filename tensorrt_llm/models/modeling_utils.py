@@ -21,8 +21,9 @@ import json
 import os
 import re
 from enum import IntFlag, auto
-from functools import cached_property
-from typing import TYPE_CHECKING, Dict, Generator, List, Optional, Union
+from functools import cached_property, lru_cache
+from typing import (TYPE_CHECKING, Dict, FrozenSet, Generator, List, Optional,
+                    Tuple, Union)
 
 from pydantic import Field, PrivateAttr
 
@@ -121,6 +122,11 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.SAVE_HIDDEN_STATES
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
+
+
+# fnmatch metacharacters. A pattern containing none of these matches exactly
+# one string, so it can be resolved by set membership instead of a linear scan.
+_GLOB_METACHARS = re.compile(r'[*?\[]')
 
 
 class QuantConfig(StrictBaseModel):
@@ -242,6 +248,32 @@ class QuantConfig(StrictBaseModel):
         else:
             return None
 
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _split_exclude_patterns(
+            patterns: Tuple[str,
+                            ...]) -> Tuple[FrozenSet[str], Tuple[str, ...]]:
+        """Split exclusion patterns into literals and patterns needing matching.
+
+        A pattern with no ``fnmatch`` metacharacter and no ``re:`` prefix
+        matches exactly one candidate, so ``fnmatch.fnmatchcase(candidate, p)``
+        is equivalent to ``candidate == p`` and can be answered by set
+        membership. The trailing-``.*`` rule cannot apply to such a pattern
+        either, since ``*`` is itself a metacharacter.
+
+        This matters for checkpoints that publish a large literal exclusion
+        list: GLM-5.3-Flash ships 1509 entries, all literal, and the linear
+        scan costs ~2 ms per module name -- around 87 s for its ~37k modules.
+        """
+        literals = set()
+        matched = []
+        for pattern in patterns:
+            if pattern.startswith("re:") or _GLOB_METACHARS.search(pattern):
+                matched.append(pattern)
+            else:
+                literals.add(pattern)
+        return frozenset(literals), tuple(matched)
+
     def is_module_excluded_from_quantization(self, name: str) -> bool:
         """Check if the module is excluded from quantization.
 
@@ -266,9 +298,13 @@ class QuantConfig(StrictBaseModel):
         """
         if self.exclude_modules is None:
             return False
+        literals, patterns = self._split_exclude_patterns(
+            tuple(self.exclude_modules))
         candidate = name
         while True:
-            for exclude_module in self.exclude_modules:
+            if candidate in literals:
+                return True
+            for exclude_module in patterns:
                 if exclude_module.startswith("re:"):
                     if re.fullmatch(exclude_module[3:], candidate):
                         return True

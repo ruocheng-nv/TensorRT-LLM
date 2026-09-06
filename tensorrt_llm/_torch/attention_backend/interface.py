@@ -348,8 +348,17 @@ class AttentionMetadata:
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
                 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
-                self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
-                                                     self.mamba_chunk_size)
+
+                # A hybrid cache manager may carry model-specific per-step
+                # state (e.g. paged block tables consumed inside CUDA graphs)
+                # by pointing `mamba_metadata_cls` at a Mamba2Metadata
+                # subclass; prepare()-time refresh then covers those buffers
+                # with no extra hook.
+                metadata_cls = getattr(self.kv_cache_manager,
+                                       'mamba_metadata_cls',
+                                       None) or Mamba2Metadata
+                self.mamba_metadata = metadata_cls(self.max_num_requests,
+                                                   self.mamba_chunk_size)
             else:
                 self.mamba_metadata = False
                 return

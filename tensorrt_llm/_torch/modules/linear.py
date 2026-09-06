@@ -142,8 +142,12 @@ def load_weight_shard(
     QKV/gate-up sharding dicts, and quant-specific scale/packing semantics that
     this function does not.
     """
-    # Skip device transfers on integrated GPUs to conserve shared memory
-    if weight.device.type != device.type and is_device_integrated():
+    # Skip device transfers on integrated GPUs to conserve shared memory.
+    # Guarded on the type first: a lazy safetensors slice (PySafeSlice) has no
+    # `.device`, and the transfer decision only applies to real tensors.
+    if isinstance(
+            weight, torch.Tensor
+    ) and weight.device.type != device.type and is_device_integrated():
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
         # Avoiding device transfers reduces memory consumption and unnecessary data copies,
         # enabling support for larger models on memory-constrained systems.
@@ -3656,8 +3660,13 @@ class Linear(nn.Module):
         else:
             weight = weights
 
-        # Skip device transfers on integrated GPUs to conserve shared memory
-        if weight.device.type != device.type and is_device_integrated():
+        # Skip device transfers on integrated GPUs to conserve shared memory.
+        # Guarded on the type first: a lazy safetensors slice (PySafeSlice)
+        # has no `.device`, and the transfer decision only applies to real
+        # tensors.
+        if isinstance(
+                weight, torch.Tensor
+        ) and weight.device.type != device.type and is_device_integrated():
             # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
             # Avoiding device transfers reduces memory consumption and unnecessary data copies,
             # enabling support for larger models on memory-constrained systems.
