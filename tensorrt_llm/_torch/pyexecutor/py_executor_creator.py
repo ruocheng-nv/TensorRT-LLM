@@ -1124,6 +1124,14 @@ def _create_py_executor_impl(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
+    # Model, KV-cache and warmup state is long-lived. Freezing it keeps full
+    # (generation-2) collections from rescanning it during serving, where each
+    # scan stalls one rank's kernel launches for hundreds of milliseconds and
+    # the other TP ranks wait at the next collective. PyExecutor.shutdown
+    # unfreezes it.
+    gc.collect()
+    gc.freeze()
+
     with _startup_timer.phase("executor_start_worker"):
         py_executor.start_worker()
 

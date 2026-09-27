@@ -3,6 +3,7 @@
 
 import dataclasses
 import datetime
+import gc
 import math
 import os
 import sys
@@ -1734,6 +1735,9 @@ class PyExecutor:
             self.encoder_launch_executor = None
 
         self.worker_started = False
+        # Return the heap frozen at startup (create_py_executor) to the
+        # collector so this executor's reference cycles can be freed.
+        gc.unfreeze()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
