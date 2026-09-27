@@ -273,6 +273,18 @@ _PREFILL_MODULE: Optional[ModuleType] = None
 _PREFILL_IMPORT_ERROR: Optional[Exception] = None
 
 
+def _zero_pad_tokens(x: torch.Tensor, padded_tokens: int) -> torch.Tensor:
+    """Copy ``x`` ([1, T, ...]) into a [1, padded_tokens, ...] buffer with a zero tail.
+
+    Matches F.pad but writes zeros only past T instead of filling the whole buffer.
+    """
+    out = x.new_empty((x.shape[0], padded_tokens, *x.shape[2:]))
+    num_tokens = x.shape[1]
+    out[:, :num_tokens].copy_(x)
+    out[:, num_tokens:].zero_()
+    return out
+
+
 def _load_prefill_module() -> ModuleType:
     """Import the in-tree prefill custom-op module (registers the op)."""
     global _PREFILL_MODULE, _PREFILL_IMPORT_ERROR
@@ -545,8 +557,6 @@ class KDAKernelDispatch:
             )
 
         if use_optimized:
-            import torch.nn.functional as F
-
             real_T = q.shape[1]
             if cu_seqlens is not None:
                 # The op's varlen single-seq path (Phase 2.1) expects the
@@ -556,12 +566,8 @@ class KDAKernelDispatch:
                 # would run the mask-free kernel on a partial final chunk.
                 # Multi-seq varlen runs the masked path and needs no pad.
                 if cu_seqlens.shape[0] == 2 and real_T % chunk_size != 0:
-                    pad = chunk_size - real_T % chunk_size
-                    q = F.pad(q, (0, 0, 0, 0, 0, pad))
-                    k = F.pad(k, (0, 0, 0, 0, 0, pad))
-                    v = F.pad(v, (0, 0, 0, 0, 0, pad))
-                    g = F.pad(g, (0, 0, 0, 0, 0, pad))
-                    beta = F.pad(beta, (0, 0, 0, pad))
+                    padded_T = real_T + chunk_size - real_T % chunk_size
+                    q, k, v, g, beta = (_zero_pad_tokens(t, padded_T) for t in (q, k, v, g, beta))
 
             A_log_kernel = A_log.detach() if A_log is not None else None
             dt_bias_kernel = dt_bias.detach() if dt_bias is not None else None
