@@ -254,6 +254,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+        # Opt-in (default off): with chunked prefill, only the first context
+        # request of an iteration may be split. A later request that is not yet
+        # started and does not fit whole waits for the next iteration, so a
+        # step never ends with the partial head of a new prompt whose first
+        # token then waits on further steps. See _schedule_loop.
+        self._chunk_head_only = os.environ.get("TLLM_CTX_CHUNK_HEAD_ONLY", "0") == "1"
 
     @property
     def scheduling_state_range(
@@ -499,6 +505,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
+                if self._defers_partial_first_chunk(req, budget, scheduled_ctx):
+                    continue
                 action, tokens, chunking_flag = self._try_schedule_context(req, budget)
                 if action is ScheduleAction.STOP:
                     break
@@ -819,6 +827,26 @@ class KVCacheV2Scheduler(RequestScheduler):
             return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
+
+    def _defers_partial_first_chunk(
+        self, req: LlmRequest, budget: BudgetTracker, scheduled_ctx: RequestList
+    ) -> bool:
+        """Whether TLLM_CTX_CHUNK_HEAD_ONLY holds back a new prompt that would be split.
+
+        Only applies after another context request is already scheduled this
+        iteration, so the head of the queue always makes progress.
+        """
+        if not (
+            self._chunk_head_only
+            and self.chunking_enabled
+            and self.chunking_policy != ContextChunkingPolicy.FORCE_CHUNK
+            and scheduled_ctx
+            and req.is_first_context_chunk
+        ):
+            return False
+        remaining = budget.remaining_tokens
+        needed = req.context_remaining_length + get_draft_token_length(req)
+        return remaining is not None and needed > remaining
 
     def _has_context_chunk_budget(self, budget: BudgetTracker) -> bool:
         remaining = budget.remaining_tokens

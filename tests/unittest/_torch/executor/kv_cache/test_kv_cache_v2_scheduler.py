@@ -2102,6 +2102,44 @@ class TestChunkedContext:
         assert ids(out.context_requests) == [0]
 
 
+class TestChunkHeadOnly:
+    """TLLM_CTX_CHUNK_HEAD_ONLY: only the first context request of a step may be split."""
+
+    @staticmethod
+    def _sched(monkeypatch, enabled: bool):
+        monkeypatch.setenv("TLLM_CTX_CHUNK_HEAD_ONLY", "1" if enabled else "0")
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        return make_scheduler(mgr, max_num_tokens=500, ctx_chunk_config=(None, 64))
+
+    def test_default_splits_second_prompt(self, monkeypatch):
+        sched = self._sched(monkeypatch, enabled=False)
+        head, nxt = make_ctx_request(0, 300), make_ctx_request(1, 300)
+        out = sched.schedule_request([head, nxt], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert nxt.context_chunk_size == 192  # (500 - 300) // 64 * 64
+
+    def test_defers_new_prompt_that_does_not_fit(self, monkeypatch):
+        sched = self._sched(monkeypatch, enabled=True)
+        head, nxt = make_ctx_request(0, 300), make_ctx_request(1, 300)
+        out = sched.schedule_request([head, nxt], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 300
+
+    def test_schedules_second_prompt_that_fits(self, monkeypatch):
+        sched = self._sched(monkeypatch, enabled=True)
+        head, nxt = make_ctx_request(0, 300), make_ctx_request(1, 200)
+        out = sched.schedule_request([head, nxt], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert nxt.context_chunk_size == 200
+
+    def test_head_prompt_is_still_split(self, monkeypatch):
+        sched = self._sched(monkeypatch, enabled=True)
+        head = make_ctx_request(0, 1000)
+        out = sched.schedule_request([head], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 448  # 500 // 64 * 64
+
+
 # ===========================================================================
 # Draft Token Fitting (Chunked Last Chunk)
 # ===========================================================================
