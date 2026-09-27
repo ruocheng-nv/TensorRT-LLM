@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -188,6 +188,80 @@ __global__ void scale_1x128_kernel(
     size_t scales_along_dim_y = div_up(dim_y, 1);
     size_t stride_scale_dim_y = div_up(dim_y, 4) * 4;
     using Input2Type = typename std::conditional<std::is_same<InputType, half>::value, half2, __nv_bfloat162>::type;
+    if constexpr (std::is_same_v<InputType, __nv_bfloat16> && std::is_same_v<OutputType, __nv_fp8_e4m3>)
+    {
+        // Full 128-wide groups with 16-byte aligned rows: 16 lanes own one group,
+        // each loading 8 inputs at once and storing its 8 outputs at once. The
+        // arithmetic matches the per-element loop below.
+        if (dim_x % 128 == 0 && reinterpret_cast<uintptr_t>(input) % 16 == 0
+            && reinterpret_cast<uintptr_t>(output) % 8 == 0)
+        {
+            constexpr int kLanesPerGroup = 16;
+            size_t const num_groups = scales_along_dim_x * scales_along_dim_y;
+            size_t const groups_per_step = (size_t) gridDim.x * blockDim.x / kLanesPerGroup;
+            size_t const thread_group = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) / kLanesPerGroup;
+            int const sub_lane = threadIdx.x % kLanesPerGroup;
+            // Step per warp so both half-warps stay converged for the shuffles.
+            for (size_t warp_group = thread_group & ~size_t(1); warp_group < num_groups; warp_group += groups_per_step)
+            {
+                size_t const group = warp_group + (thread_group & 1);
+                bool const active = group < num_groups;
+                size_t const scales_idx_y = group / scales_along_dim_x;
+                size_t const scales_idx_x = group % scales_along_dim_x;
+                size_t const offset = scales_idx_y * dim_x + scales_idx_x * 128 + sub_lane * 8;
+                uint4 packed = make_uint4(0, 0, 0, 0);
+                if (active)
+                {
+                    packed = *reinterpret_cast<uint4 const*>(input + offset);
+                }
+                __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&packed);
+                InputType input_amax = InputType(0);
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                {
+                    input_amax = InputType(__hmax(input_amax, __hmax(__habs(pairs[i].x), __habs(pairs[i].y))));
+                }
+#pragma unroll
+                for (int mask = kLanesPerGroup / 2; mask > 0; mask /= 2)
+                {
+                    input_amax
+                        = InputType(std::max(float(input_amax), __shfl_xor_sync(0xFFFFFFFF, float(input_amax), mask)));
+                }
+                if (!active)
+                {
+                    continue;
+                }
+                InputType amax = tensorrt_llm::common::cuda_max(input_amax, InputType(1e-10f));
+                ScaleType quant_scale = 448.f / ScaleType(amax);
+                ScaleType dequant_scale;
+                if constexpr (USE_UE8M0)
+                {
+                    ScaleType dequant_scale_raw = 1.f / quant_scale;
+                    __nv_fp8_e8m0 ue8m0_scale;
+                    ue8m0_scale.__x = __nv_cvt_float_to_e8m0(float(dequant_scale_raw), __NV_SATFINITE, cudaRoundPosInf);
+                    dequant_scale = ScaleType(static_cast<float>(ue8m0_scale));
+                    quant_scale = dequant_scale != ScaleType(0.f) ? 1.f / dequant_scale : 1.f;
+                }
+                else
+                {
+                    dequant_scale = 1.f / quant_scale;
+                }
+                if (sub_lane == 0)
+                {
+                    scales[scales_idx_x * stride_scale_dim_y + scales_idx_y] = dequant_scale;
+                }
+                OutputType quantized[8];
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                {
+                    quantized[2 * i] = OutputType(ScaleType(pairs[i].x) * quant_scale);
+                    quantized[2 * i + 1] = OutputType(ScaleType(pairs[i].y) * quant_scale);
+                }
+                *reinterpret_cast<uint2*>(output + offset) = *reinterpret_cast<uint2 const*>(quantized);
+            }
+            return;
+        }
+    }
     for (size_t warp_idx = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
          warp_idx < scales_along_dim_x * scales_along_dim_y; warp_idx += gridDim.x * blockDim.x / 32)
     {
