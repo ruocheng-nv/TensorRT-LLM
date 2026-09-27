@@ -51,7 +51,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention, kda_verify_cu_seqlens
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -795,6 +795,7 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         dtype: torch.dtype = torch.bfloat16,
         mapping: Mapping | None = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.ONESHOT,
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         del dtype  # the shared mixer is bf16 (fp32 gate parameters and pools)
         # The checkpoint's ``linear_attn_config`` does not name the gate rank:
@@ -807,7 +808,13 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         # The mixer's own row-parallel o_proj AllReduce (fixed strategy; the
         # size-aware Glm5NextAllReduce used elsewhere is a perf option, not a
         # correctness requirement, and AUTO's autotuner raced at TP4 decode).
-        super().__init__(config, layer_idx, mapping=mapping, allreduce_strategy=allreduce_strategy)
+        super().__init__(
+            config,
+            layer_idx,
+            mapping=mapping,
+            allreduce_strategy=allreduce_strategy,
+            aux_stream=aux_stream,
+        )
         # Preserve checkpoint FP32 gate parameters. MetaInitMode rejects detach
         # on meta tensors, so create empty FP32 parameters on that branch.
         for name in ("A_log", "dt_bias"):
@@ -1181,12 +1188,14 @@ class Glm5NextSparseAttention(nn.Module):
         rows_per_request: int = 1,
         reduce: bool = True,
         request_ids: torch.Tensor | None = None,
+        max_visible: int | None = None,
     ) -> torch.Tensor:
         """Score pools, select members and tail, then attend to paged latent rows.
 
         visible gives each query's prefix length. Packed context uses request_ids;
         verification uses rows_per_request. Single-token decode reads live lengths
         from metadata. All device work uses fixed buffer shapes for graph replay.
+        max_visible is an optional host bound on visible that limits scoring work.
         """
         indexer = self.indexer
         rows = q_resid.shape[0]
@@ -1204,6 +1213,7 @@ class Glm5NextSparseAttention(nn.Module):
             kv_lens=kv_lens,
             rows_per_request=rows_per_request,
             request_ids=request_ids,
+            max_kv_len=max_visible,
         )
         num_cand = (visible // indexer.index_kpool).to(torch.int32)
         selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=scores.device)
@@ -1269,6 +1279,10 @@ class Glm5NextSparseAttention(nn.Module):
                 request_ids=rows.final_request_ids,
             )
         query = self.q_b_proj(q_resid).view(-1, self.num_heads, self.qk_head_dim)
+        max_visible = max(
+            int(cached_lens[i]) + int(cu_seqlens[i + 1]) - int(cu_seqlens[i])
+            for i in range(len(cu_seqlens) - 1)
+        )
         return self._select_and_attend_paged(
             q_resid,
             query,
@@ -1278,6 +1292,7 @@ class Glm5NextSparseAttention(nn.Module):
             AttentionInputType.context_only,
             reduce=reduce,
             request_ids=rows.request_ids,
+            max_visible=max_visible,
         )
 
     def forward_decode(
@@ -1421,10 +1436,12 @@ class Glm5NextSparseAttention(nn.Module):
 
 
 class Glm5NextGate(DeepseekV3Gate):
-    """DeepSeek noaux_tc routing with FP32 weights, logits and correction bias.
+    """DeepSeek noaux_tc routing with FP32 logits and correction bias.
 
-    Preserve small inter-expert score differences when adding the correction bias;
-    rounding it to BF16 can change expert selection.
+    The checkpoint router weight is BF16, so the base BF16 GEMM with FP32 output
+    forms the same products as FP32 math. Preserve small inter-expert score
+    differences when adding the correction bias; rounding it to BF16 can change
+    expert selection.
     """
 
     def __init__(self, config: PretrainedConfig, moe_backend: str = "CUTLASS") -> None:
@@ -1437,22 +1454,17 @@ class Glm5NextGate(DeepseekV3Gate):
             n_group=int(getattr(config, "n_group", 1) or 1),
             topk_group=int(getattr(config, "topk_group", 1) or 1),
             routed_scaling_factor=float(config.routed_scaling_factor),
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=moe_backend,
         )
-        self.hidden_size = int(config.hidden_size)
         self.norm_topk_prob = bool(config.norm_topk_prob)
         # FP32 regardless of the MoE backend (the base class picks bf16 for
         # TRTLLM); the fused routing kernels consume the FP32 tensor directly.
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(int(config.n_routed_experts), dtype=torch.float32), requires_grad=False
         )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        flat = hidden_states.reshape(-1, self.hidden_size)
-        return torch.nn.functional.linear(flat.float(), self.weight)
 
 
 class Glm5NextMoE(nn.Module):
@@ -1659,6 +1671,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
         model_config: ModelConfig,
         dtype: torch.dtype = torch.bfloat16,
         aux_stream: torch.cuda.Stream | None = None,
+        attention_aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -1674,6 +1687,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 dtype=dtype,
                 mapping=mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
+                aux_stream=attention_aux_stream,
             )
         else:
             self.self_attn = Glm5NextSparseAttention(
@@ -1774,8 +1788,11 @@ class Glm5NextModel(DecoderModel):
 
         # Decoder and draft layers execute serially and share this side stream.
         self.aux_stream_dict = {}
-        if not model_config.mapping.enable_attention_dp and torch.cuda.is_available():
-            self.aux_stream_dict[AuxStreamType.MoeShared] = torch.cuda.Stream()
+        if torch.cuda.is_available():
+            # KDA overlaps its small gate projections with the QKV projection.
+            self.aux_stream_dict[AuxStreamType.Attention] = torch.cuda.Stream()
+            if not model_config.mapping.enable_attention_dp:
+                self.aux_stream_dict[AuxStreamType.MoeShared] = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(int(config.vocab_size), int(config.hidden_size), dtype=dtype)
         self.layers = nn.ModuleList(
@@ -1787,6 +1804,7 @@ class Glm5NextModel(DecoderModel):
                     model_config,
                     dtype=dtype,
                     aux_stream=self.aux_stream_dict.get(AuxStreamType.MoeShared),
+                    attention_aux_stream=self.aux_stream_dict.get(AuxStreamType.Attention),
                 )
                 for i in range(schedule.num_layers)
             ]
@@ -1818,20 +1836,15 @@ class Glm5NextModel(DecoderModel):
         streams = self.expand_streams(inputs_embeds)
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
+        self._prepare_kda_verify_offsets(attn_metadata, runtime_ctx)
         # Only the decoder stack: under one-model MTP the speculative base
         # class appends the draft layer(s) to ``self.layers`` (so the
         # checkpoint's ``model.layers.45.*`` names resolve), and those run in
         # the speculative worker's draft loop, not here.
-        # Generation-only batches take the fused hyper-connection loop. Prefill
-        # (and mixed) batches keep the per-layer path so the engine's warmup /
-        # KV-cache sizing pass measures the same activation peak that mixed
-        # context+generation iterations reach in production (a lower
-        # pure-prefill peak over-allocates the KV cache and OOMs later).
-        if (
-            runtime_ctx.num_contexts == 0
-            and runtime_ctx.num_generations > 0
-            and self._fused_hc_ok()
-        ):
+        # Every batch phase takes the fused hyper-connection loop, so the
+        # engine's warmup / KV-cache sizing pass measures the same activation
+        # peak that mixed context+generation iterations reach in production.
+        if self._fused_hc_ok():
             return self.collapse_streams(self._forward_single_phase_fused_hc(streams, runtime_ctx))
         for layer_idx in range(self.schedule.num_layers):
             streams = self.layers[layer_idx](
@@ -1841,6 +1854,40 @@ class Glm5NextModel(DecoderModel):
                 runtime_ctx=runtime_ctx,
             )
         return self.collapse_streams(streams)
+
+    def _prepare_kda_verify_offsets(
+        self, attn_metadata: AttentionMetadata, runtime_ctx: Glm5NextRuntimeContext
+    ) -> None:
+        """Compute fused KDA verification offsets once for all local KDA layers.
+
+        Accepted-draft counts are shared across layers, so the per-request token
+        offsets are identical for every KDA layer of this forward.
+        """
+        mamba_metadata = attn_metadata.mamba_metadata
+        mamba_metadata.kda_verify_offsets = None
+        steps = runtime_ctx.gen_tokens_per_request
+        if steps <= 1 or runtime_ctx.num_generations == 0:
+            return
+        kda_layer = next(
+            (
+                i
+                for i in range(self.schedule.num_layers)
+                if self.schedule.attention[i] == LINEAR_ATTENTION
+                and not getattr(self.layers[i], "_weights_removed", False)
+            ),
+            None,
+        )
+        if kda_layer is None:
+            return
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(kda_layer)
+        if layer_cache is None or not layer_cache.has_kda_replay_caches:
+            return
+        slots = mamba_metadata.generation_state_indices
+        if slots is None:
+            start = runtime_ctx.num_contexts
+            slots = mamba_metadata.state_indices[start : start + runtime_ctx.num_generations]
+        pending = layer_cache.prev_num_accepted_tokens[slots]
+        mamba_metadata.kda_verify_offsets = (pending, kda_verify_cu_seqlens(pending, steps))
 
     def _fused_hc_ok(self) -> bool:
         """Whether every decoder layer is local (no PP pruning) for the fused loop."""
@@ -1863,8 +1910,8 @@ class Glm5NextModel(DecoderModel):
         RMSNorm; ``mHC.fused_hc`` (the in-tree DeepSeek-V4 boundary op) runs
         the three as one kernel, so a layer costs 2 fused boundaries instead
         of 4 mappings + 2 norms. The math matches the per-layer forward; the
-        first pre-mapping and last post-mapping stay unfused. Only generation-only batches use it
-        (see :meth:`forward`).
+        first pre-mapping and last post-mapping stay unfused. Pipeline-parallel
+        ranks keep the per-layer path (see :meth:`_fused_hc_ok`).
         """
         num_layers = self.schedule.num_layers
         first = self.layers[0]
