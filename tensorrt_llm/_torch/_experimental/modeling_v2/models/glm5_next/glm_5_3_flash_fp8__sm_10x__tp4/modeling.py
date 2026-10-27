@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
+    compact_sparse_rows,
     kpool_expand,
     kpool_score,
 )
@@ -60,6 +61,7 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
+from .ops.attention.head_major import quantize_1x128, saturate_fp8
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 from .ops.moe.decode_moe import MAX_ROWS as _DECODE_MOE_ROWS
 from .ops.moe.decode_moe import decode_moe
@@ -326,20 +328,58 @@ class PrefillTarget:
         query = _fp8_linear(q_resid, full.q_b, full.q_b_scale).view(
             num_rows, num_heads, attn.qk_head_dim
         )
-        q_latent = torch.bmm(query.transpose(0, 1), full.w_k).transpose(0, 1)
-        out_latent = backend.forward(
-            q_latent,
-            None,
-            None,
-            metadata,
-            AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
-            ),
+        q_latent = torch.bmm(query.transpose(0, 1), full.w_k)  # [heads, rows, kv_lora]
+        out_latent, nonempty = _sparse_attention_fp8(
+            attn.attn_backend, saturate_fp8(q_latent), topk_rows, metadata
         )
         per_head = out_latent.view(num_rows, num_heads, attn.kv_lora_rank)
-        values = torch.bmm(per_head.transpose(0, 1), full.w_v_t).transpose(0, 1)
-        out[lo:hi] = _fp8_linear(values.reshape(num_rows, -1), full.o, full.o_scale)
+        values, values_scale = quantize_1x128(torch.bmm(per_head.transpose(0, 1), full.w_v_t))
+        projected = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+            values, full.o, values_scale, full.o_scale
+        )
+        # A row without a selected key has an unspecified attention output; it projects to 0.
+        out[lo:hi] = torch.where(nonempty[:, None], projected, 0)
+
+
+def _sparse_attention_fp8(backend, query: torch.Tensor, topk_rows: torch.Tensor, metadata):
+    """The kpool backend's native sparse attention over an FP8 KV cache, for FP8 queries
+    ``[R, H, kv_lora]``: the kernel and arguments of ``backend.forward``, without its
+    saturating query cast (the caller's) or its zeroing of rows that selected no key
+    (returned as ``nonempty`` for the caller to apply to a smaller tensor)."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    state = backend._cache_state(metadata)
+    kv_rows, _, _ = latent_pool_rows(state.latent_pool)
+    assert kv_rows.dtype == torch.float8_e4m3fn and query.dtype == torch.float8_e4m3fn
+    native = backend._native_decode
+    native.prepare_workspace(
+        query,
+        metadata,
+        max_query_rows=max(metadata.max_num_tokens, query.shape[0]),
+        query_dtype=kv_rows.dtype,
+    )
+    if backend._native_bmm1_scale is None:
+        backend._native_bmm1_scale = float(backend.kv_scale_quant_orig) * backend.softmax_scale
+    packed, lengths, nonempty = compact_sparse_rows(topk_rows)
+    output = trtllm_batch_decode_with_kv_cache_mla(
+        query=query.unsqueeze(1),
+        kv_cache=kv_rows.view(-1, 1, 32, 512),
+        workspace_buffer=metadata.effective_workspace.view(torch.uint8),
+        qk_nope_head_dim=256,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        block_tables=packed.unsqueeze(1),
+        seq_lens=lengths,
+        max_seq_len=packed.shape[1],
+        sparse_mla_top_k=packed.shape[1],
+        bmm1_scale=backend._native_bmm1_scale,
+        bmm2_scale=backend.kv_scale_quant_orig,
+        backend="trtllm-gen",
+        sparse_mla_top_k_lens=lengths,
+        multi_ctas_kv_counter_buffer=native._counter,
+        use_fp16_softmax=False,
+    ).squeeze(1)
+    return output, nonempty
 
 
 def _kda_partial(attn, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata):
