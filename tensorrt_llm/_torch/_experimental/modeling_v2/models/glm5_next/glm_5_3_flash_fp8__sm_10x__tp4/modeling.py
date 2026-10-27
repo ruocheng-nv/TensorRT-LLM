@@ -19,17 +19,33 @@ from typing import Any, Optional
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    AttentionMetadata,
+)
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.params import (
+    GlmKpoolBackendForwardArgs,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_glm5_next import (
+    LINEAR_ATTENTION,
     Glm5NextForCausalLM,
     Glm5NextModel,
+    Glm5NextMoE,
+    Glm5NextRuntimeContext,
+    Glm5NextSparseAttention,
     _normalize_glm5_next_top_config,
+    build_glm5_next_runtime_context,
     glm5_next_is_quantized,
     glm5_next_text_quant_config,
     resolve_glm5_next_schedule,
 )
+from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
@@ -44,11 +60,39 @@ _SMS = ((10, 0), (10, 3))
 _TP = 4
 
 
+def _fp8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` for a 128 x 128 block-FP8 weight: 1 x 128 activation quantization and
+    the CuTe DSL Blackwell blockwise GEMM, the pair the block-FP8 ``Linear`` runs."""
+    x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
+    return torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(x_fp8, weight, x_scale, weight_scale)
+
+
 class PrefillTarget:
-    """Forwards that carry context rows: the decoder stack over the packed batch."""
+    """Forwards that carry context rows: the decoder stack over the packed batch.
+
+    A step of at least ``SP_MIN_TOKENS`` rows runs sequence parallel. Rank ``r`` owns
+    rows ``[r * n, (r + 1) * n)`` of the packed batch (``n = ceil(T / 4)``) and keeps
+    the mHC streams of those rows only, so every boundary (post-mapping, pre-mapping,
+    RMSNorm) runs over a quarter of the rows. Each sublayer is all-gather, the
+    sublayer over all rows, reduce-scatter: the same bytes as the all-reduce it
+    replaces. KDA, the MoE and the dense MLPs produce head- or intermediate-split
+    partials as under TP. The MLA layers compute their context rows sequence
+    parallel: all 64 heads for the owned rows only (indexer scoring, top-k, sparse
+    attention, o_proj), and zero for the others, so the reduce-scatter leaves each
+    owned row's full value. Under TP the same rows cost four times the KV gathering,
+    once per 16-head shard, and every rank scored every row. Generation rows of a
+    mixed step stay head-parallel. Smaller steps run the built-in forward.
+    """
+
+    SP_MIN_TOKENS = 2048
 
     def __init__(self, core: "Glm53FlashFp8Sm10xTp4Core") -> None:
         self.core = core
+        mapping = core.model_config.mapping
+        self.tp_size = mapping.tp_size
+        self.tp_rank = mapping.tp_rank
+        self.group = list(mapping.tp_group)
+        self.process_group = mapping.tp_group_pg.boxed() if mpi_disabled() else None
 
     def forward(
         self,
@@ -58,13 +102,221 @@ class PrefillTarget:
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        return Glm5NextModel.forward(
-            self.core,
-            attn_metadata=attn_metadata,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+        num_tokens = (input_ids if input_ids is not None else inputs_embeds).shape[0]
+        if num_tokens < self.SP_MIN_TOKENS:
+            return Glm5NextModel.forward(
+                self.core,
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
+        return self._forward_sequence_parallel(attn_metadata, input_ids, inputs_embeds)
+
+    def _gather(self, local: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        return allgather(local, None, self.group, self.process_group)[:num_tokens]
+
+    def _scatter(self, partial: torch.Tensor, rows: int) -> torch.Tensor:
+        pad = rows * self.tp_size - partial.shape[0]
+        if pad:
+            partial = torch.nn.functional.pad(partial, (0, 0, 0, pad))
+        return reducescatter(partial, None, self.group, self.process_group)
+
+    def _forward_sequence_parallel(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor],
+        inputs_embeds: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        core = self.core
+        if inputs_embeds is None:
+            inputs_embeds = core.embed_tokens(input_ids)
+        num_tokens = inputs_embeds.shape[0]
+        rows = -(-num_tokens // self.tp_size)
+        first_row = self.tp_rank * rows
+        own = inputs_embeds[first_row : first_row + rows]
+        if own.shape[0] < rows:
+            own = torch.nn.functional.pad(own, (0, 0, 0, rows - own.shape[0]))
+        runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
+
+        num_layers = core.schedule.num_layers
+        first = core.layers[0]
+        residual = core.expand_streams(own)
+        post, comb, x = first.hc_attn.pre_mapping(residual)
+        x = first.input_layernorm(x)
+        for layer_idx in range(num_layers):
+            layer = core.layers[layer_idx]
+            full = self._gather(x, num_tokens)
+            if layer.attention_type == LINEAR_ATTENTION:
+                partial = _kda_partial(layer.self_attn, full, attn_metadata)
+            else:
+                partial = self._mla_partial(layer_idx, layer.self_attn, full, runtime_ctx, rows)
+            del full
+            residual, post, comb, x = layer.hc_ffn.fused_hc(
+                self._scatter(partial, rows),
+                residual,
+                post,
+                comb,
+                norm_weight=layer.post_attention_layernorm.weight,
+                norm_eps=layer.post_attention_layernorm.variance_epsilon,
+            )
+            del partial
+            full = self._gather(x, num_tokens)
+            partial = _mlp_partial(layer.mlp, full)
+            del full
+            mlp_out = self._scatter(partial, rows)
+            del partial
+            if layer_idx + 1 < num_layers:
+                nxt = core.layers[layer_idx + 1]
+                residual, post, comb, x = nxt.hc_attn.fused_hc(
+                    mlp_out,
+                    residual,
+                    post,
+                    comb,
+                    norm_weight=nxt.input_layernorm.weight,
+                    norm_eps=nxt.input_layernorm.variance_epsilon,
+                )
+            else:
+                residual = layer.hc_ffn.post_mapping(mlp_out, residual, post, comb)
+            del mlp_out
+        return self._gather(core.collapse_streams(residual), num_tokens)
+
+    def _mla_partial(
+        self,
+        layer_idx: int,
+        attn: Glm5NextSparseAttention,
+        hidden_states: torch.Tensor,
+        ctx: Glm5NextRuntimeContext,
+        rows: int,
+    ) -> torch.Tensor:
+        """This rank's contribution to the MLA output of every row: the full value of its
+        own context rows, zero for the other context rows, and the head-shard partial of
+        the generation rows."""
+        out = hidden_states.new_zeros(hidden_states.shape)
+        num_ctx = ctx.num_ctx_tokens
+        if ctx.num_contexts:
+            lo = min(self.tp_rank * rows, num_ctx)
+            hi = min(lo + rows, num_ctx)
+            self._mla_context_rows(layer_idx, attn, hidden_states[:num_ctx], ctx, lo, hi, out)
+        if ctx.num_generations:
+            generation = hidden_states[num_ctx:]
+            lengths = ctx.kv_lens[ctx.num_contexts :]
+            if ctx.gen_tokens_per_request == 1:
+                out[num_ctx:] = attn.forward_decode(
+                    generation, kv_lens=lengths, metadata=ctx.metadata, reduce=False
+                )
+            else:
+                out[num_ctx:] = attn.forward_verify(
+                    generation,
+                    kv_lens=lengths,
+                    metadata=ctx.metadata,
+                    tokens_per_request=ctx.gen_tokens_per_request,
+                    reduce=False,
+                )
+        return out
+
+    def _mla_context_rows(
+        self,
+        layer_idx: int,
+        attn: Glm5NextSparseAttention,
+        hidden_states: torch.Tensor,
+        ctx: Glm5NextRuntimeContext,
+        lo: int,
+        hi: int,
+        out: torch.Tensor,
+    ) -> None:
+        """Append every context row's latent and indexer state, then attend rows
+        ``[lo, hi)`` with all heads and write their o_proj output into ``out``."""
+        indexer = attn.indexer
+        backend = attn.attn_backend
+        metadata = ctx.metadata
+        kpool = indexer.index_kpool
+        sched = ctx.context_rows(kpool, hidden_states.device)
+        # The cache holds every row, so the latent and indexer-key projections do too.
+        q_resid, latent, packed, index_weights = attn._project_attention_and_indexer(
+            hidden_states
         )
+        backend.append_paged_state(
+            latent, packed, sched.positions, metadata, request_ids=sched.request_ids
+        )
+        if sched.final_positions.shape[0]:
+            backend.update_pool_keys(
+                sched.final_positions,
+                indexer.index_kpool_compress_ape,
+                metadata,
+                request_ids=sched.final_request_ids,
+            )
+        if lo >= hi:
+            return
+        full = self.core.mla_full[layer_idx]
+        num_rows = hi - lo
+        q_resid = q_resid[lo:hi]
+        positions = sched.positions[lo:hi]
+        request_ids = sched.request_ids[lo:hi]
+        visible = positions + 1
+        max_visible = max(
+            int(ctx.cached_lens[i]) + int(ctx.ctx_cu_seqlens[i + 1]) - int(ctx.ctx_cu_seqlens[i])
+            for i in range(ctx.num_contexts)
+        )
+        q_index = indexer.wq_b(q_resid).view(num_rows, indexer.n_heads, indexer.head_dim)
+        scores = backend.score_pools(
+            q_index,
+            index_weights[lo:hi],
+            metadata,
+            q_scale=indexer.softmax_scale,
+            w_scale=indexer.head_mix_scale,
+            kv_lens=visible,
+            rows_per_request=1,
+            request_ids=request_ids,
+            max_kv_len=max_visible,
+        )
+        num_cand = (visible // kpool).to(torch.int32)
+        selected = torch.empty(num_rows, indexer.select_k, dtype=torch.int32, device=scores.device)
+        indexer.pool_top_k(
+            scores,
+            selected,
+            is_prefill=False,
+            sequence_lengths=num_cand,
+            scan_lengths=num_cand,
+        )
+        topk_rows = backend.expand_selection(
+            selected, metadata, kv_lens=visible, rows_per_request=1, request_ids=request_ids
+        )
+        num_heads = full.w_k.shape[0]
+        query = _fp8_linear(q_resid, full.q_b, full.q_b_scale).view(
+            num_rows, num_heads, attn.qk_head_dim
+        )
+        q_latent = torch.bmm(query.transpose(0, 1), full.w_k).transpose(0, 1)
+        out_latent = backend.forward(
+            q_latent,
+            None,
+            None,
+            metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
+            ),
+        )
+        per_head = out_latent.view(num_rows, num_heads, attn.kv_lora_rank)
+        values = torch.bmm(per_head.transpose(0, 1), full.w_v_t).transpose(0, 1)
+        out[lo:hi] = _fp8_linear(values.reshape(num_rows, -1), full.o, full.o_scale)
+
+
+def _kda_partial(attn, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata):
+    """The KDA mixer's row-split o_proj output, before its all-reduce."""
+    core = attn._forward_impl(hidden_states, attn_metadata)
+    if isinstance(core, _KdaPrequantizedCore):
+        return attn.o_proj.forward_prequantized(core.activation, core.scale)
+    return attn.o_proj(core.reshape(-1, attn.proj_size))
+
+
+def _mlp_partial(mlp, hidden_states: torch.Tensor) -> torch.Tensor:
+    """The FFN's intermediate-split output, before its all-reduce: the routed plus the
+    shared expert partials, or a dense MLP built with ``reduce_output=False``."""
+    if isinstance(mlp, Glm5NextMoE):
+        routed = mlp.experts(hidden_states, mlp.gate(hidden_states))
+        return routed + mlp.shared_experts(hidden_states)
+    return mlp(hidden_states)
 
 
 class DecodeTarget:
