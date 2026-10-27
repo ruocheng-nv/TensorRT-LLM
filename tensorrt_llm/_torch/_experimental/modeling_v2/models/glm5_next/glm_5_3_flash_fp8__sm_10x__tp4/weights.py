@@ -74,9 +74,11 @@ def load_weights(text_model, weights: Any) -> None:
     core = text_model.model
     config = core.config
     schedule = core.schedule
+    num_mtp = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+    # The decoder's MLA layers and the MTP layers appended after them (all sparse MLA).
     mla_layers = frozenset(
         i for i in range(schedule.num_layers) if schedule.attention[i] == SPARSE_ATTENTION
-    )
+    ) | frozenset(range(schedule.num_layers, schedule.num_layers + num_mtp))
     core.mla_full = mla_full_weights(
         weights,
         mla_layers,

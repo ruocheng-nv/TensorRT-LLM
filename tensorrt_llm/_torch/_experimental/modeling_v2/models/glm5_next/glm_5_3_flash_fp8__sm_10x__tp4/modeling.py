@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
     Glm5NextLinearAttention,
     Glm5NextModel,
     Glm5NextMoE,
+    Glm5NextMTP,
     Glm5NextRuntimeContext,
     Glm5NextSparseAttention,
     _normalize_glm5_next_top_config,
@@ -191,6 +192,32 @@ class PrefillTarget:
                 residual = layer.hc_ffn.post_mapping(mlp_out, residual, post, comb)
             del mlp_out
         return self._gather(core.collapse_streams(residual), num_tokens)
+
+    def mtp_forward(
+        self,
+        layer: Glm5NextMTP,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        embed_tokens: torch.nn.Module,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """The MTP layer over a step of at least ``SP_MIN_TOKENS`` rows, sequence parallel
+        like the decoder: its row-parallel eh_proj reduce-scatters to the owned rows, the
+        attention and the FFN are all-gather, sublayer, reduce-scatter, and the normalized
+        output is gathered back to every row."""
+        num_tokens = hidden_states.shape[0]
+        rows = -(-num_tokens // self.tp_size)
+        joined = torch.cat([layer.enorm(embed_tokens(input_ids)), layer.hnorm(hidden_states)], -1)
+        own_slice = torch.chunk(joined, self.tp_size, dim=-1)[self.tp_rank]
+        residual = self._scatter(torch.nn.functional.linear(own_slice, layer.eh_proj.weight), rows)
+        runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
+        full = self._gather(layer.input_layernorm(residual), num_tokens)
+        partial = self._mla_partial(layer.layer_idx, layer.self_attn, full, runtime_ctx, rows)
+        del full
+        residual = residual + self._scatter(partial, rows)
+        partial = self._ffn_partial(layer.mlp, layer.post_attention_layernorm(residual), num_tokens)
+        residual = residual + self._scatter(partial, rows)
+        return self._gather(layer.shared_head.norm(residual), num_tokens)
 
     def _ffn_partial(self, mlp, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
         """The FFN's intermediate-split output for every row, from this rank's rows ``x``.
@@ -733,6 +760,40 @@ def _use_decode_moe(moe: Glm5NextMoE, routed_scaling_factor: float) -> None:
     moe.__class__ = _DecodeMoe
 
 
+class _SequenceParallelMtp(Glm5NextMTP):
+    """The MTP layer with steps that carry context rows and at least ``SP_MIN_TOKENS`` rows
+    on ``PrefillTarget.mtp_forward``; other steps take the parent's forward."""
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        embed_tokens: torch.nn.Module,
+        attn_metadata: AttentionMetadata,
+        all_rank_num_tokens: list[int] | None = None,
+        spec_metadata: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if attn_metadata.num_contexts == 0 or hidden_states.shape[0] < PrefillTarget.SP_MIN_TOKENS:
+            return super().forward(
+                input_ids,
+                position_ids,
+                hidden_states,
+                embed_tokens,
+                attn_metadata,
+                all_rank_num_tokens,
+                spec_metadata,
+                **kwargs,
+            )
+        hidden_states = self.sequence_parallel.mtp_forward(
+            self, input_ids, hidden_states, embed_tokens, attn_metadata
+        )
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+        return hidden_states
+
+
 class Glm53FlashFp8Sm10xTp4Core(Glm5NextModel):
     """The decoder stack, with the per-step choice between the two targets."""
 
@@ -754,6 +815,10 @@ class Glm53FlashFp8Sm10xTp4Core(Glm5NextModel):
                 _use_decode_moe(layer.mlp, float(self.config.routed_scaling_factor))
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
+        for layer in self.layers:
+            if isinstance(layer, Glm5NextMTP):
+                layer.sequence_parallel = self._prefill
+                layer.__class__ = _SequenceParallelMtp
 
     def _select_target(self, attn_metadata: AttentionMetadata) -> "PrefillTarget | DecodeTarget":
         if self._decode is None:
