@@ -55,6 +55,8 @@ from tensorrt_llm.logger import logger
 
 from . import weights as _weights
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
+from .ops.moe.decode_moe import MAX_ROWS as _DECODE_MOE_ROWS
+from .ops.moe.decode_moe import decode_moe
 
 # The deployment this target is written for; route() selects it on the same facts,
 # and the constructor states them again for a direct construction.
@@ -432,6 +434,61 @@ def _use_low_m_projections(layer) -> None:
             _low_m_linear(linear)
 
 
+class _DecodeMoe(Glm5NextMoE):
+    """The MoE branch with decode steps of at most 4 rows on ``decode_moe``.
+
+    Those steps take the router GEMM and three Triton launches (top-8, FC1 + SwiGLU,
+    FC2 + combine, the shared expert as the ninth slot) in place of the activation
+    quantization, routing, two grouped GEMMs, activation, finalize, the shared expert's
+    GEMMs and the partial sum. Larger steps take the grouped-GEMM path.
+    """
+
+    def forward(
+        self, x: torch.Tensor, all_rank_num_tokens: list[int] | None = None
+    ) -> torch.Tensor:
+        flat = x.reshape(-1, self.hidden_size)
+        if flat.shape[0] > _DECODE_MOE_ROWS:
+            return super().forward(x, all_rank_num_tokens)
+        backend = self.experts.backend
+        out = decode_moe(
+            flat.contiguous(),
+            self.gate(flat),
+            self.gate.e_score_correction_bias,
+            self.decode_scaling,
+            self.swiglu_limit,
+            backend.w3_w1_weight,
+            backend.w3_w1_weight_scaling_factor,
+            backend.w2_weight,
+            backend.w2_weight_scaling_factor,
+            *self.decode_shared,
+        )
+        if self.moe_all_reduce is not None:
+            out = self.moe_all_reduce(out)
+        return out.view_as(x)
+
+
+@torch.no_grad()
+def _use_decode_moe(moe: Glm5NextMoE, routed_scaling_factor: float) -> None:
+    """Give ``moe`` the decode path, with its shared expert in the routed experts' layout."""
+    backend = moe.experts.backend
+    if backend.w3_w1_weight.dtype != torch.float8_e4m3fn or backend.num_fused_shared_expert:
+        return
+    shared = moe.shared_experts
+    gate_up, gate_up_scale = shared.gate_up_proj.weight, shared.gate_up_proj.weight_scale
+    assert gate_up.dtype == torch.float8_e4m3fn and gate_up.shape == backend.w3_w1_weight.shape[1:]
+    # GatedMLP stores [gate; up], the routed experts [up (w3); gate (w1)].
+    gate, up = gate_up.chunk(2, dim=0)
+    gate_s, up_s = gate_up_scale.chunk(2, dim=0)
+    moe.decode_shared = (
+        torch.cat([up, gate]).contiguous(),
+        torch.cat([up_s, gate_s]).float().contiguous(),
+        shared.down_proj.weight.contiguous(),
+        shared.down_proj.weight_scale.float().contiguous(),
+    )
+    moe.decode_scaling = float(routed_scaling_factor)
+    moe.__class__ = _DecodeMoe
+
+
 class Glm53FlashFp8Sm10xTp4Core(Glm5NextModel):
     """The decoder stack, with the per-step choice between the two targets."""
 
@@ -449,6 +506,8 @@ class Glm53FlashFp8Sm10xTp4Core(Glm5NextModel):
         # Every decoder layer, the MTP layer's included (it is appended to ``self.layers``).
         for layer in self.layers:
             _use_low_m_projections(layer)
+            if isinstance(getattr(layer, "mlp", None), Glm5NextMoE):
+                _use_decode_moe(layer.mlp, float(self.config.routed_scaling_factor))
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
