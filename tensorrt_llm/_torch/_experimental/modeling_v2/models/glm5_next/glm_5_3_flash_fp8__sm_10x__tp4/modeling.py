@@ -34,6 +34,7 @@ from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_glm5_next import (
     LINEAR_ATTENTION,
     Glm5NextForCausalLM,
+    Glm5NextLinearAttention,
     Glm5NextModel,
     Glm5NextMoE,
     Glm5NextRuntimeContext,
@@ -53,6 +54,7 @@ from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
+from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 
 # The deployment this target is written for; route() selects it on the same facts,
 # and the constructor states them again for a direct construction.
@@ -342,6 +344,94 @@ class DecodeTarget:
         )
 
 
+# Decode rows (MTP-3 verify of up to eight requests); prefill keeps the module GEMMs.
+_LOW_M_ROWS = 32
+
+
+class _KdaLowMProjections(Glm5NextLinearAttention):
+    """The KDA mixer with its small-M BF16 projections on ``low_m_bf16_gemm``.
+
+    Decode and verify steps run the ``[f_a | g_a | b]`` gate projection, which sits on
+    the critical path of every KDA layer (its aux-stream chain outlasts the qkv GEMM),
+    and the row-parallel o_proj on the FlashInfer low-M kernels. Larger row counts take
+    the parent's GEMMs.
+    """
+
+    def _project_gate_inputs(self, x: torch.Tensor):
+        rows = x.reshape(-1, x.shape[-1])
+        if rows.shape[0] > _LOW_M_ROWS:
+            return super()._project_gate_inputs(x)
+        hd, H = self.head_dim, self.num_heads
+        bfa = low_m_bf16_gemm(rows, self._bfa_proj_weight).view(*x.shape[:-1], -1)
+        beta = bfa[..., 2 * hd : 2 * hd + H]
+        lead = bfa.shape[:-1]
+        pair = bfa[..., : 2 * hd].reshape(-1, 2, hd).transpose(0, 1)
+        gates = torch.bmm(pair, self._gate_b_t)  # [2, N, D]
+        return beta, gates[0].reshape(*lead, -1), gates[1].reshape(*lead, -1)
+
+    def _project_output(self, core) -> torch.Tensor:
+        if isinstance(core, _KdaPrequantizedCore):
+            return super()._project_output(core)
+        flat = core.reshape(-1, self.proj_size)
+        if flat.shape[0] > _LOW_M_ROWS:
+            return super()._project_output(core)
+        out = low_m_bf16_gemm(flat, self.o_proj.weight)
+        if self._o_allreduce is not None:
+            out = self._o_allreduce(out)
+        return out
+
+
+def _bf16_weight(linear: torch.nn.Module) -> torch.Tensor:
+    """The Linear's weight in BF16: as stored, or dequantized from 128 x 128 block FP8."""
+    weight = linear.weight
+    if weight.dtype == torch.bfloat16:
+        return weight
+    assert weight.dtype == torch.float8_e4m3fn, f"unexpected weight dtype {weight.dtype}"
+    n, k = weight.shape
+    scale = linear.weight_scale
+    assert scale.shape == (n // 128, k // 128), f"block scales {tuple(scale.shape)} for {n} x {k}"
+    blocks = weight.float().view(n // 128, 128, k // 128, 128) * scale.float()[:, None, :, None]
+    return blocks.view(n, k).to(torch.bfloat16)
+
+
+def _low_m_linear(module: torch.nn.Module) -> None:
+    """Run a Linear of at most ``_LOW_M_ROWS`` rows on ``low_m_bf16_gemm``.
+
+    A block-FP8 weight gets a dequantized BF16 copy for those rows: the decode-sized
+    product reads twice the bytes but skips the activation quantization, and the
+    low-M kernel is still faster than quantize + blockwise FP8 GEMM there; larger
+    row counts keep the FP8 GEMM.
+    """
+    full_rank = module.forward
+    weight = _bf16_weight(module)
+
+    def forward(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        rows = x.reshape(-1, x.shape[-1])
+        if args or kwargs or rows.shape[0] > _LOW_M_ROWS:
+            return full_rank(x, *args, **kwargs)
+        return low_m_bf16_gemm(rows, weight).view(*x.shape[:-1], -1)
+
+    module.forward = forward
+
+
+def _use_low_m_projections(layer) -> None:
+    attn = layer.self_attn
+    if isinstance(attn, Glm5NextLinearAttention):
+        assert not attn.use_full_rank_gate and attn._bfa_proj_weight is not None
+        assert attn.o_proj.weight.dtype == torch.bfloat16 and attn.o_proj.bias is None
+        attn.__class__ = _KdaLowMProjections
+    elif isinstance(attn, Glm5NextSparseAttention):
+        for linear in (
+            attn.kv_a_proj_with_mqa,
+            attn.q_b_proj,
+            attn.o_proj,
+            attn.indexer.wk_gate_wp,
+            attn.indexer.wq_b,
+        ):
+            assert linear.bias is None
+            _low_m_linear(linear)
+
+
 class Glm53FlashFp8Sm10xTp4Core(Glm5NextModel):
     """The decoder stack, with the per-step choice between the two targets."""
 
@@ -356,6 +446,9 @@ class Glm53FlashFp8Sm10xTp4Core(Glm5NextModel):
         shell and the loader's module walk), so it only builds once."""
         if self._decode is not None:
             return
+        # Every decoder layer, the MTP layer's included (it is appended to ``self.layers``).
+        for layer in self.layers:
+            _use_low_m_projections(layer)
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
