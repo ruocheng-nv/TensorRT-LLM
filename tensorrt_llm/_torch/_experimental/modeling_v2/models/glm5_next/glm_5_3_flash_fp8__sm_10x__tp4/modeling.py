@@ -22,19 +22,12 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    AttentionMetadata,
-)
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     compact_sparse_rows,
     kpool_expand,
     kpool_score,
-)
-from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.params import (
-    GlmKpoolBackendForwardArgs,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
@@ -56,6 +49,7 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
 from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import mpi_disabled
@@ -384,8 +378,11 @@ def _sparse_attention_fp8(backend, query: torch.Tensor, topk_rows: torch.Tensor,
         max_query_rows=max(metadata.max_num_tokens, query.shape[0]),
         query_dtype=kv_rows.dtype,
     )
-    if backend._native_bmm1_scale is None:
+    if backend._native_bmm1_scale is None and not torch.cuda.is_current_stream_capturing():
         backend._native_bmm1_scale = float(backend.kv_scale_quant_orig) * backend.softmax_scale
+    bmm1_scale = backend._native_bmm1_scale
+    if bmm1_scale is None:
+        bmm1_scale = backend.kv_scale_quant_orig * backend.softmax_scale
     packed, lengths, nonempty = compact_sparse_rows(topk_rows)
     output = trtllm_batch_decode_with_kv_cache_mla(
         query=query.unsqueeze(1),
@@ -398,7 +395,7 @@ def _sparse_attention_fp8(backend, query: torch.Tensor, topk_rows: torch.Tensor,
         seq_lens=lengths,
         max_seq_len=packed.shape[1],
         sparse_mla_top_k=packed.shape[1],
-        bmm1_scale=backend._native_bmm1_scale,
+        bmm1_scale=bmm1_scale,
         bmm2_scale=backend.kv_scale_quant_orig,
         backend="trtllm-gen",
         sparse_mla_top_k_lens=lengths,
@@ -467,6 +464,9 @@ class DecodeTarget:
 
     def __init__(self, core: "Glm53FlashFp8Sm10xTp4Core") -> None:
         self.core = core
+        # The MLA verify's query branch runs on this stream beside the cache / selection branch.
+        self.aux_stream = torch.cuda.Stream()
+        self.events = (torch.cuda.Event(), torch.cuda.Event())
 
     def forward(
         self,
@@ -501,7 +501,7 @@ class DecodeTarget:
             else:
                 if sched is None:
                     sched = _VerifySchedule.build(ctx, layer.self_attn.indexer.index_kpool)
-                attn_out = _mla_verify(layer.self_attn, x, ctx, sched)
+                attn_out = _mla_verify(layer.self_attn, x, ctx, sched, self.aux_stream, self.events)
             residual, post, comb, x = layer.hc_ffn.fused_hc(
                 attn_out,
                 residual,
@@ -533,68 +533,84 @@ def _mla_verify(
     hidden_states: torch.Tensor,
     ctx: Glm5NextRuntimeContext,
     sched: _VerifySchedule,
+    aux_stream: torch.cuda.Stream,
+    events: tuple,
 ) -> torch.Tensor:
-    """``Glm5NextSparseAttention.forward_verify`` and its all-reduce on the step's schedule:
-    the same kernels, with the schedule's positions, lengths and repeated tables."""
+    """``Glm5NextSparseAttention.forward_verify`` and its all-reduce on the step's schedule.
+
+    After the input projections two independent branches run on two streams: the query
+    branch (q_b, the absorbed key projection, the saturating FP8 cast of the latent
+    query) on ``aux_stream``, and the cache / selection branch (latent and indexer-key
+    appends, pool scoring, top-k, row expansion) on the calling stream. The sparse
+    attention reads the FP8 query directly; rows that selected no key are zeroed after
+    o_proj, on [rows, hidden] instead of the [rows, heads, kv_lora] latent."""
     indexer = attn.indexer
     backend = attn.attn_backend
     metadata = ctx.metadata
     batch, tokens = sched.positions.shape
     num_rows = batch * tokens
     q_resid, latent, packed, index_weights = attn._project_attention_and_indexer(hidden_states)
-    backend.append_paged_state(
-        latent.view(batch, tokens, -1), packed.view(batch, tokens, -1), sched.positions, metadata
+    w_k, w_v_t = attn.absorbed_kv_b()
+
+    def query_branch() -> torch.Tensor:
+        query = attn.q_b_proj(q_resid).view(num_rows, attn.num_heads, attn.qk_head_dim)
+        return saturate_fp8(torch.bmm(query.transpose(0, 1), w_k))
+
+    def selection_branch() -> torch.Tensor:
+        backend.append_paged_state(
+            latent.view(batch, tokens, -1),
+            packed.view(batch, tokens, -1),
+            sched.positions,
+            metadata,
+        )
+        backend.update_pool_keys(sched.positions, indexer.index_kpool_compress_ape, metadata)
+        q_index = indexer.wq_b(q_resid).view(num_rows, indexer.n_heads, indexer.head_dim)
+        state = backend._cache_state(metadata)
+        params = backend.sparse_params
+        capacity = state.block_tables.shape[1] * state.tokens_per_block
+        scores = kpool_score(
+            q_index,
+            index_weights,
+            state.index_pool,
+            sched.tables,
+            sched.visible,
+            state.tokens_per_block,
+            num_pools_max=(capacity + params.index_kpool - 1) // params.index_kpool,
+            head_dim=params.index_head_dim,
+            kpool=params.index_kpool,
+            q_scale=indexer.softmax_scale,
+            w_scale=indexer.head_mix_scale,
+            precision="bf16",
+        )
+        selected = torch.empty(num_rows, indexer.select_k, dtype=torch.int32, device=scores.device)
+        indexer.pool_top_k(
+            scores,
+            selected,
+            is_prefill=False,
+            sequence_lengths=sched.num_cand,
+            scan_lengths=sched.num_cand,
+        )
+        _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
+        return kpool_expand(
+            selected,
+            sched.visible,
+            sched.tables,
+            state.tokens_per_block,
+            base_row=base_row,
+            rows_per_slot=rows_per_slot,
+            kpool=params.index_kpool,
+            out_width=params.kernel_output_width,
+        )
+
+    topk_rows, query_fp8 = maybe_execute_in_parallel(
+        selection_branch, query_branch, events[0], events[1], aux_stream
     )
-    backend.update_pool_keys(sched.positions, indexer.index_kpool_compress_ape, metadata)
-    query = attn.q_b_proj(q_resid).view(num_rows, attn.num_heads, attn.qk_head_dim)
-    q_index = indexer.wq_b(q_resid).view(num_rows, indexer.n_heads, indexer.head_dim)
-    state = backend._cache_state(metadata)
-    params = backend.sparse_params
-    capacity = state.block_tables.shape[1] * state.tokens_per_block
-    scores = kpool_score(
-        q_index,
-        index_weights,
-        state.index_pool,
-        sched.tables,
-        sched.visible,
-        state.tokens_per_block,
-        num_pools_max=(capacity + params.index_kpool - 1) // params.index_kpool,
-        head_dim=params.index_head_dim,
-        kpool=params.index_kpool,
-        q_scale=indexer.softmax_scale,
-        w_scale=indexer.head_mix_scale,
-        precision="bf16",
-    )
-    selected = torch.empty(num_rows, indexer.select_k, dtype=torch.int32, device=scores.device)
-    indexer.pool_top_k(
-        scores,
-        selected,
-        is_prefill=False,
-        sequence_lengths=sched.num_cand,
-        scan_lengths=sched.num_cand,
-    )
-    _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
-    topk_rows = kpool_expand(
-        selected,
-        sched.visible,
-        sched.tables,
-        state.tokens_per_block,
-        base_row=base_row,
-        rows_per_slot=rows_per_slot,
-        kpool=params.index_kpool,
-        out_width=params.kernel_output_width,
-    )
-    out_latent = backend.forward(
-        attn.absorb_query(query),
-        None,
-        None,
-        metadata,
-        AttentionForwardArgs(
-            attention_input_type=AttentionInputType.generation_only,
-            sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
-        ),
-    )
-    return attn.project_output_latent(out_latent, reduce=True)
+    out_latent, nonempty = _sparse_attention_fp8(backend, query_fp8, topk_rows, metadata)
+    per_head = out_latent.view(num_rows, attn.num_heads, attn.kv_lora_rank)
+    values = torch.bmm(per_head.transpose(0, 1), w_v_t)  # [heads, rows, v_head]
+    out = attn.o_proj(values.transpose(0, 1).reshape(num_rows, -1))
+    out = torch.where(nonempty[:, None], out, 0)
+    return out if attn.tp_all_reduce is None else attn.tp_all_reduce(out)
 
 
 # Decode rows (MTP-3 verify of up to eight requests); prefill keeps the module GEMMs.
