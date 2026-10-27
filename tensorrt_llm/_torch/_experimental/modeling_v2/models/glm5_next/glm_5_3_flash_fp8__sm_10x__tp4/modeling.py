@@ -14,6 +14,7 @@ targets per step:
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -25,6 +26,11 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     AttentionMetadata,
+)
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
+    kpool_expand,
+    kpool_score,
 )
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.params import (
     GlmKpoolBackendForwardArgs,
@@ -323,8 +329,44 @@ def _mlp_partial(mlp, hidden_states: torch.Tensor) -> torch.Tensor:
     return mlp(hidden_states)
 
 
+@dataclass
+class _VerifySchedule:
+    """Per-step row schedule of a verify step, shared by every MLA layer of the forward.
+
+    Row ``b * T + t`` is request ``b``'s draft position ``t``: its cache position, its
+    visible length and complete-pool count, and its request's block table (repeated per
+    row, as the pool scoring and expansion kernels address it). Built once per forward
+    from device lengths and tables only, so CUDA graphs replay it on refreshed metadata.
+    """
+
+    positions: torch.Tensor  # [B, T] int64
+    visible: torch.Tensor  # [B * T] int64
+    num_cand: torch.Tensor  # [B * T] int32
+    tables: torch.Tensor  # [B * T, max pages] int32
+
+    @classmethod
+    def build(cls, ctx: Glm5NextRuntimeContext, kpool: int) -> "_VerifySchedule":
+        tokens = ctx.gen_tokens_per_request
+        lengths = ctx.kv_lens[ctx.num_contexts :]
+        steps = torch.arange(tokens, device=lengths.device)
+        positions = (lengths - tokens).unsqueeze(1) + steps
+        visible = (positions + 1).reshape(-1)
+        tables = ctx.metadata.mamba_metadata.glm_block_tables[: ctx.kv_lens.shape[0]]
+        return cls(
+            positions,
+            visible,
+            (visible // kpool).to(torch.int32),
+            tables[ctx.num_contexts :].repeat_interleave(tokens, dim=0),
+        )
+
+
 class DecodeTarget:
-    """Generation-only forwards: every row is a generation (or verify) row."""
+    """Generation-only forwards: every row is a generation (or verify) row.
+
+    The built-in single-phase loop with fused mHC boundaries, except that the MLA layers
+    of a verify step take ``_mla_verify``: the row schedule they all need is built once
+    per step instead of once per layer.
+    """
 
     def __init__(self, core: "Glm53FlashFp8Sm10xTp4Core") -> None:
         self.core = core
@@ -337,13 +379,125 @@ class DecodeTarget:
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        return Glm5NextModel.forward(
-            self.core,
-            attn_metadata=attn_metadata,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
+        core = self.core
+        ctx = build_glm5_next_runtime_context(attn_metadata)
+        if ctx.gen_tokens_per_request == 1 or not core._fused_hc_ok():
+            return Glm5NextModel.forward(
+                core,
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
+        if inputs_embeds is None:
+            inputs_embeds = core.embed_tokens(input_ids)
+        sched = None
+        num_layers = core.schedule.num_layers
+        first = core.layers[0]
+        residual = core.expand_streams(inputs_embeds)
+        post, comb, x = first.hc_attn.pre_mapping(residual)
+        x = first.input_layernorm(x)
+        for layer_idx in range(num_layers):
+            layer = core.layers[layer_idx]
+            if layer.attention_type == LINEAR_ATTENTION:
+                attn_out = layer.self_attn(x, attn_metadata)
+            else:
+                if sched is None:
+                    sched = _VerifySchedule.build(ctx, layer.self_attn.indexer.index_kpool)
+                attn_out = _mla_verify(layer.self_attn, x, ctx, sched)
+            residual, post, comb, x = layer.hc_ffn.fused_hc(
+                attn_out,
+                residual,
+                post,
+                comb,
+                norm_weight=layer.post_attention_layernorm.weight,
+                norm_eps=layer.post_attention_layernorm.variance_epsilon,
+            )
+            del attn_out
+            mlp_out = layer.run_mlp(x, None)
+            if layer_idx + 1 < num_layers:
+                nxt = core.layers[layer_idx + 1]
+                residual, post, comb, x = nxt.hc_attn.fused_hc(
+                    mlp_out,
+                    residual,
+                    post,
+                    comb,
+                    norm_weight=nxt.input_layernorm.weight,
+                    norm_eps=nxt.input_layernorm.variance_epsilon,
+                )
+            else:
+                residual = layer.hc_ffn.post_mapping(mlp_out, residual, post, comb)
+            del mlp_out
+        return core.collapse_streams(residual)
+
+
+def _mla_verify(
+    attn: Glm5NextSparseAttention,
+    hidden_states: torch.Tensor,
+    ctx: Glm5NextRuntimeContext,
+    sched: _VerifySchedule,
+) -> torch.Tensor:
+    """``Glm5NextSparseAttention.forward_verify`` and its all-reduce on the step's schedule:
+    the same kernels, with the schedule's positions, lengths and repeated tables."""
+    indexer = attn.indexer
+    backend = attn.attn_backend
+    metadata = ctx.metadata
+    batch, tokens = sched.positions.shape
+    num_rows = batch * tokens
+    q_resid, latent, packed, index_weights = attn._project_attention_and_indexer(hidden_states)
+    backend.append_paged_state(
+        latent.view(batch, tokens, -1), packed.view(batch, tokens, -1), sched.positions, metadata
+    )
+    backend.update_pool_keys(sched.positions, indexer.index_kpool_compress_ape, metadata)
+    query = attn.q_b_proj(q_resid).view(num_rows, attn.num_heads, attn.qk_head_dim)
+    q_index = indexer.wq_b(q_resid).view(num_rows, indexer.n_heads, indexer.head_dim)
+    state = backend._cache_state(metadata)
+    params = backend.sparse_params
+    capacity = state.block_tables.shape[1] * state.tokens_per_block
+    scores = kpool_score(
+        q_index,
+        index_weights,
+        state.index_pool,
+        sched.tables,
+        sched.visible,
+        state.tokens_per_block,
+        num_pools_max=(capacity + params.index_kpool - 1) // params.index_kpool,
+        head_dim=params.index_head_dim,
+        kpool=params.index_kpool,
+        q_scale=indexer.softmax_scale,
+        w_scale=indexer.head_mix_scale,
+        precision="bf16",
+    )
+    selected = torch.empty(num_rows, indexer.select_k, dtype=torch.int32, device=scores.device)
+    indexer.pool_top_k(
+        scores,
+        selected,
+        is_prefill=False,
+        sequence_lengths=sched.num_cand,
+        scan_lengths=sched.num_cand,
+    )
+    _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
+    topk_rows = kpool_expand(
+        selected,
+        sched.visible,
+        sched.tables,
+        state.tokens_per_block,
+        base_row=base_row,
+        rows_per_slot=rows_per_slot,
+        kpool=params.index_kpool,
+        out_width=params.kernel_output_width,
+    )
+    out_latent = backend.forward(
+        attn.absorb_query(query),
+        None,
+        None,
+        metadata,
+        AttentionForwardArgs(
+            attention_input_type=AttentionInputType.generation_only,
+            sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
+        ),
+    )
+    return attn.project_output_latent(out_latent, reduce=True)
 
 
 # Decode rows (MTP-3 verify of up to eight requests); prefill keeps the module GEMMs.
