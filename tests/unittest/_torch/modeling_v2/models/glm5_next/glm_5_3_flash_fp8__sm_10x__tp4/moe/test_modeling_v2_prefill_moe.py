@@ -53,7 +53,7 @@ def _build(spec: dict, seed: int):
     w31, s31 = fp8(e, 2 * i, h), scales(e, 2 * i // 128, h // 128, fan_in=h)
     w2, s2 = fp8(e, h, i), scales(e, h // 128, i // 128, fan_in=i)
     addend = torch.randn(t, h, generator=g, device="cuda").to(torch.bfloat16)
-    return (x_fp8, x_scale.t(), logits, bias, 2.5, 10.0, w31, s31, w2, s2, addend)
+    return (x_fp8, x_scale, logits, bias, 2.5, 10.0, w31, s31, w2, s2, addend)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])

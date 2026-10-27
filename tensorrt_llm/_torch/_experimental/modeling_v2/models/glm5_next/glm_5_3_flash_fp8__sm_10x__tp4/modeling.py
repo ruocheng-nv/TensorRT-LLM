@@ -203,16 +203,15 @@ class PrefillTarget:
         """
         x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
         x_fp8 = self._gather(x_fp8.view(torch.uint8), num_tokens).view(torch.float8_e4m3fn)
-        # [rows, hidden / 128] scales for the grouped GEMMs; K-block-major for the dense ones.
-        row_scale = self._gather(x_scale.t().contiguous(), num_tokens)
-        x_scale = row_scale.t().contiguous()
+        # Gathered row-major, then returned to the K-block-major layout the GEMMs read.
+        x_scale = self._gather(x_scale.t().contiguous(), num_tokens).t().contiguous()
         if isinstance(mlp, Glm5NextMoE):
             logits = self._gather(mlp.gate(x), num_tokens)
             shared = _gated_mlp_from_fp8(mlp.shared_experts, x_fp8, x_scale)
             backend = mlp.experts.backend
             return prefill_moe(
                 x_fp8,
-                row_scale,
+                x_scale,
                 logits,
                 mlp.gate.e_score_correction_bias,
                 mlp.decode_scaling,

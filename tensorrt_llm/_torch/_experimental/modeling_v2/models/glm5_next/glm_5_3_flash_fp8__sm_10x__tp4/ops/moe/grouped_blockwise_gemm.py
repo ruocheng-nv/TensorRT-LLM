@@ -57,6 +57,13 @@ scale warps then index B and SFB by that expert, and A, SFA and C by batch 0.
 
 A cluster must work on one expert, so the MMA tile is at most 128 rows and the cluster grows
 only along N (a 2-CTA MMA uses 64-row CTA tiles inside one 128-row group).
+
+``grouped_blockwise_fp8_gemm_gathered`` reads A as ``x[row_index]`` from the un-permuted
+activations instead of a pre-gathered copy. Each lane of the TMA warp issues one
+``tile::gather4`` (four source rows of 128 bytes) per K tile into the SW128 A stage, through a
+2D descriptor whose box is one row; with an A-multicast cluster the CTAs split the row groups.
+The scale warp copies each row's scales with 4-byte ``cp.async`` from the same indices. The
+bytes in shared memory match the TMA tile load's, so the output is bitwise the same.
 """
 
 from typing import Dict, Tuple, Union
@@ -68,13 +75,61 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass._mlir.dialects import cute as _cute_ir
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from tensorrt_llm._torch.kernels.blackwell.blockwise_gemm.blockwise_gemm import (
     Sm100BlockwiseGemmKernel,
 )
+
+
+@dsl_user_op
+def _tma_gather4_load(tma_atom, smem_dst, mbar, col, rows, mcast_mask, *, loc=None, ip=None):
+    """Issue one 1-CTA ``cp.async.bulk.tensor.2d...tile::gather4``: rows ``rows[0..3]``,
+    columns ``[col, col + box)``, into four consecutive smem box rows at ``smem_dst``.
+
+    A row index outside the tensor (e.g. -1) makes the TMA unit fill that row with zeros.
+    With ``mcast_mask`` the rows land at the same offset in every CTA of the mask.
+    """
+    exec_atom = _cute_nvgpu_ir.atom_make_exec_tma(tma_atom._trait.value, loc=loc, ip=ip)
+    desc_ptr_ty = _cute_ir.PtrType.get(
+        _cute_nvgpu_ir.TmaDescriptorTiledType.get(), cute.AddressSpace.generic, 64
+    )
+    desc = _cute_nvgpu_ir.get_tma_desc_addr(desc_ptr_ty, exec_atom, loc=loc, ip=ip)
+    operands = [
+        cutlass.Int32(smem_dst.toint()).ir_value(loc=loc, ip=ip),
+        desc.toint().ir_value(loc=loc, ip=ip),
+        cutlass.Int32(mbar.toint()).ir_value(loc=loc, ip=ip),
+        cutlass.Int32(col).ir_value(loc=loc, ip=ip),
+    ] + [cutlass.Int32(rows[j]).ir_value(loc=loc, ip=ip) for j in range(4)]
+    if mcast_mask is None:
+        asm = (
+            "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
+            ".mbarrier::complete_tx::bytes [$0], [$1, {$3, $4, $5, $6, $7}], [$2];"
+        )
+        constraints = "r,l,r,r,r,r,r,r"
+    else:
+        asm = (
+            "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
+            ".mbarrier::complete_tx::bytes.multicast::cluster"
+            " [$0], [$1, {$3, $4, $5, $6, $7}], [$2], $8;"
+        )
+        operands.append(cutlass.Int16(mcast_mask).ir_value(loc=loc, ip=ip))
+        constraints = "r,l,r,r,r,r,r,r,h"
+    llvm.inline_asm(
+        None,
+        operands,
+        asm,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
@@ -96,6 +151,7 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         sfa: cute.Tensor,
         sfb: cute.Tensor,
         tile_expert: cute.Tensor,
+        row_index: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -104,7 +160,9 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
 
         ``a`` is (rows, K, 1), ``b`` is (N, K, E), ``c`` is (rows, N, 1), ``sfa`` is
         (rows, K / 128, 1), ``sfb`` is (N / 128, K / 128, E) and ``tile_expert`` is
-        (rows / 128,) Int32.
+        (rows / 128,) Int32. With ``gather_a``, ``a`` and ``sfa`` are the un-permuted
+        (T, K, 1) and (T, K / 128, 1) tensors and ``row_index`` (rows,) Int32 gives each
+        output row's source row; otherwise ``row_index`` is unused.
         """
         self.a_dtype = a.element_type
         self.b_dtype = b.element_type
@@ -133,17 +191,33 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # Setup TMA load for A
-        a_op = self._get_tma_atom_kind(atom_thr_size, self.is_a_mcast)
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            a,
-            a_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=(cutlass.TFloat32 if a.element_type is cutlass.Float32 else None),
-        )
+        if cutlass.const_expr(self.gather_a):
+            # A 2D descriptor whose box is one 128-byte row with the 128-byte swizzle of the
+            # K-major A tile: a tile::gather4 through it writes four rows at the offsets the
+            # MMA reads (row m of a stage at m * 128 bytes).
+            a_row_layout = cute.make_composed_layout(
+                cute.make_swizzle(3, 4, 3),
+                0,
+                cute.make_layout((1, self.mma_tiler[2]), stride=(self.mma_tiler[2], 1)),
+            )
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                a[(None, None, 0)],
+                a_row_layout,
+                (1, self.mma_tiler[2]),
+            )
+        else:
+            a_op = self._get_tma_atom_kind(atom_thr_size, self.is_a_mcast)
+            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+                a_op,
+                a,
+                a_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=(cutlass.TFloat32 if a.element_type is cutlass.Float32 else None),
+            )
 
         # Setup TMA load for B
         b_op = self._get_tma_atom_kind(atom_thr_size, self.is_b_mcast)
@@ -281,6 +355,8 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             self.epi_tile,
             self.tile_sched_params,
             tile_expert,
+            row_index,
+            sfa,
             epilogue_op,
         ).launch(
             grid=grid,
@@ -314,6 +390,8 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         mTileExpert: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mSFX: cute.Tensor,
         epilogue_op: cutlass.Constexpr,
     ):
         """Persistent grouped GEMM. The L coordinate a warp reads from the tile info is the
@@ -480,10 +558,6 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         #
         # Local_tile partition global tensors
         #
-        # (bM, bK, loopM, loopK, loopL)
-        gA_mkl = cute.local_tile(
-            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
-        )
         # (bN, bK, loopN, loopK, loopL)
         gB_nkl = cute.local_tile(
             mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
@@ -519,14 +593,12 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             cute.slice_(self.cta_tile_shape_mnk, (0, None, None)),
             (None, None, None),
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cute.size(gB_nkl, mode=[3])
 
         #
         # Partition global tensor for TiledMMA_A/B/C
         #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
-        tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
         tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
@@ -559,13 +631,22 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), loopM, loopK, loopL)
-        tAsA, tAgA = cpasync.tma_partition(
-            tma_atom_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(tCgA, 0, 3),
-        )
+        tAsA = None
+        tAgA = None
+        if cutlass.const_expr(not self.gather_a):
+            # (bM, bK, loopM, loopK, loopL)
+            gA_mkl = cute.local_tile(
+                mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+            )
+            # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
+            tCgA = thr_mma.partition_A(gA_mkl)
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                block_in_cluster_coord_vmnk[2],
+                a_cta_layout,
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(tCgA, 0, 3),
+            )
         # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
         # ((atom_v, rest_v), STAGE)
@@ -730,8 +811,17 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
                 #
                 # Slice to per mma tile index
                 #
-                # ((atom_v, rest_v), loopK)
-                tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, 0)]
+                tAgA_slice = None
+                a_rows = None
+                if cutlass.const_expr(self.gather_a):
+                    # Lane l gathers rows 4 l .. 4 l + 3 of the tile.
+                    a_rows = cute.make_rmem_tensor((4,), cutlass.Int32)
+                    a_row_base = tile_info[0] * self.cta_tile_shape_mnk[0] + lane_idx * 4
+                    for j in cutlass.range_constexpr(4):
+                        a_rows[j] = mRowIndex[a_row_base + j]
+                else:
+                    # ((atom_v, rest_v), loopK)
+                    tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, 0)]
                 # ((atom_v, rest_v), loopK)
                 tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
@@ -744,9 +834,13 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
                 # Tma load loop
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
+                    a_stage = ab_producer_state.index
+                    tAgA_k = None
+                    tAsA_pipe = None
+                    if cutlass.const_expr(not self.gather_a):
+                        tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
+                        tAsA_pipe = tAsA[(None, ab_producer_state.index)]
                     tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
-                    tAsA_pipe = tAsA[(None, ab_producer_state.index)]
                     tBsB_pipe = tBsB[(None, ab_producer_state.index)]
 
                     tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
@@ -761,13 +855,39 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
                     # TMA load A/B
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_k,
-                        tAsA_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=a_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(self.gather_a):
+                        a_dst = sA.iterator + (
+                            a_stage * self.cta_tile_shape_mnk[0] * self.mma_tiler[2]
+                            + lane_idx * 4 * self.mma_tiler[2]
+                        )
+                        if cutlass.const_expr(self.is_a_mcast):
+                            # The cluster's CTAs split the row groups and multicast them.
+                            if lane_idx % self.num_mcast_ctas_a == block_in_cluster_coord_vmnk[2]:
+                                _tma_gather4_load(
+                                    tma_atom_a,
+                                    a_dst,
+                                    tma_bar,
+                                    k_tile * self.mma_tiler[2],
+                                    a_rows,
+                                    a_full_mcast_mask,
+                                )
+                        else:
+                            _tma_gather4_load(
+                                tma_atom_a,
+                                a_dst,
+                                tma_bar,
+                                k_tile * self.mma_tiler[2],
+                                a_rows,
+                                None,
+                            )
+                    else:
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_k,
+                            tAsA_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=a_full_mcast_mask,
+                        )
                     cute.copy(
                         tma_atom_b,
                         tBgB_k,
@@ -851,6 +971,17 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
                     ),
                     cutlass.Boolean,
                 )
+                sfa_rows = None
+                if cutlass.const_expr(self.gather_a):
+                    # Lane l loads the scales of rows 4 l .. 4 l + 3, from their source rows.
+                    # A padding row's index may be -1; any valid row serves for it.
+                    sfa_rows = cute.make_rmem_tensor((4,), cutlass.Int32)
+                    sfa_row_base = tile_info[0] * self.cta_tile_shape_mnk[0] + lane_idx * 4
+                    for j in cutlass.range_constexpr(4):
+                        src_row = mRowIndex[sfa_row_base + j]
+                        if src_row < 0:
+                            src_row = cutlass.Int32(0)
+                        sfa_rows[j] = src_row
 
                 # Peek (try_wait) SCALE buffer empty
                 scale_producer_state.reset_count()
@@ -937,7 +1068,27 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
                     scale_pipeline.producer_acquire(scale_producer_state, peek_scale_empty_status)
 
                     # load scaleA/scaleB
-                    cute.copy(tiled_copy_sfa, tAgSFA_k, tAsSFA_pipe, pred=tApSFA)
+                    if cutlass.const_expr(self.gather_a):
+                        for j in cutlass.range_constexpr(4):
+                            sfa_src = cute.make_tensor(
+                                mSFX.iterator
+                                + cute.crd2idx(
+                                    (sfa_rows[j], scale_producer_state.count, 0), mSFX.layout
+                                ),
+                                cute.make_layout((1,)),
+                            )
+                            sfa_dst = cute.make_tensor(
+                                sSFA.iterator
+                                + (
+                                    scale_producer_state.index * self.cta_tile_shape_mnk[0]
+                                    + lane_idx * 4
+                                    + j
+                                ),
+                                cute.make_layout((1,)),
+                            )
+                            cute.copy(atom_copy, sfa_src, sfa_dst)
+                    else:
+                        cute.copy(tiled_copy_sfa, tAgSFA_k, tAsSFA_pipe, pred=tApSFA)
                     cute.copy(tiled_copy_sfb, tBgSFB_k, tBsSFB_pipe, pred=tBpSFB)
 
                     scale_pipeline.producer_commit(scale_producer_state)
@@ -1566,9 +1717,11 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
+        gather_a: bool = False,
     ):
         super().__init__(cutlass.Float32, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
         self.raster_along_m = raster_along_m
+        self.gather_a = gather_a
 
     @cute.jit
     def _tile_expert(self, work_tile, mTileExpert: cute.Tensor) -> cutlass.Int32:
@@ -1613,12 +1766,17 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         cluster_shape_mn: Tuple[int, int],
         n: int,
         k: int,
+        gather_a: bool = False,
     ) -> bool:
         """Whether a tile configuration can run the grouped GEMM.
 
         Every CTA of a cluster must work on one expert, so a cluster spans one 128-row group:
-        the MMA tile is at most 128 rows and the cluster only grows along N.
+        the MMA tile is at most 128 rows and the cluster only grows along N. The gathered A
+        load (one tile::gather4 of four rows per lane of the TMA warp) needs a 1-CTA MMA
+        with 128-row tiles.
         """
+        if gather_a and (use_2cta_instrs or mma_tiler_mn[0] != GROUP_ROW_ALIGNMENT):
+            return False
         if not Sm100BlockwiseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
         ):
@@ -1677,6 +1835,60 @@ class Sm100GroupedBlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             sfa_tensor,
             sfb_tensor,
             tile_expert,
+            tile_expert,  # row_index: unused without gather_a
+            max_active_clusters,
+            stream,
+        )
+
+    @cute.jit
+    def wrapper_gathered(
+        self,
+        rows: cutlass.Int32,
+        num_tokens: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        num_experts: cutlass.Int32,
+        sfx_stride: cutlass.Int32,
+        x_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        x_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        tile_expert_ptr: cute.Pointer,
+        row_index_ptr: cute.Pointer,
+        c_tensor: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """``wrapper_grouped`` with A and its scales read through ``row_index``."""
+        sf_k = (k + 127) // 128
+        sf_n = (n + 127) // 128
+        x_tensor = cute.make_tensor(
+            x_ptr, layout=cute.make_ordered_layout((num_tokens, k, 1), order=(1, 0, 2))
+        )
+        # [K / 128, T] in memory with row stride ``sfx_stride``: tokens are contiguous.
+        sfx_tensor = cute.make_tensor(
+            x_sf_ptr,
+            layout=cute.make_layout((num_tokens, sf_k, 1), stride=(1, sfx_stride, 0)),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr, layout=cute.make_ordered_layout((n, k, num_experts), order=(1, 0, 2))
+        )
+        sfb_tensor = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout((sf_n, sf_k, num_experts), order=(1, 0, 2)),
+        )
+        tile_expert = cute.make_tensor(
+            tile_expert_ptr, layout=cute.make_layout((rows // GROUP_ROW_ALIGNMENT,))
+        )
+        row_index = cute.make_tensor(row_index_ptr, layout=cute.make_layout((rows,)))
+        self(
+            x_tensor,
+            b_tensor,
+            c_tensor,
+            sfx_tensor,
+            sfb_tensor,
+            tile_expert,
+            row_index,
             max_active_clusters,
             stream,
         )
@@ -1693,6 +1905,11 @@ DEFAULT_TACTICS: Dict[Tuple[int, int], GroupedGemmTactic] = {
     (4096, 512): (False, (128, 128), (1, 2), False),
 }
 FALLBACK_TACTIC: GroupedGemmTactic = (False, (128, 128), (1, 1), False)
+# The gathered A load keeps up with the MMA only when the A multicast of a wide cluster splits
+# the row groups: (1, 8) covers FC1's eight N tiles.
+DEFAULT_GATHERED_TACTICS: Dict[Tuple[int, int], GroupedGemmTactic] = {
+    (1024, 4096): (False, (128, 128), (1, 8), False),
+}
 
 _compiled_kernels: Dict[Tuple, object] = {}
 
@@ -1702,18 +1919,18 @@ def _c_view(out: torch.Tensor) -> torch.Tensor:
     return out.view(1, *out.shape).permute(1, 2, 0)
 
 
-def _compile(n: int, k: int, tactic: GroupedGemmTactic, out: torch.Tensor):
+def _compile(n: int, k: int, tactic: GroupedGemmTactic, out: torch.Tensor, gather_a: bool = False):
     use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
-    key = (n, k, tactic)
+    key = (n, k, tactic, gather_a)
     compiled = _compiled_kernels.get(key)
     if compiled is not None:
         return compiled
     if not Sm100GroupedBlockwiseGemmKernel.can_implement_grouped(
-        use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, n, k
+        use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, n, k, gather_a
     ):
         raise ValueError(f"grouped blockwise FP8 GEMM cannot run N={n}, K={k} with {tactic}")
     gemm = Sm100GroupedBlockwiseGemmKernel(
-        use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along_m
+        use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, raster_along_m, gather_a
     )
     max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
@@ -1723,6 +1940,28 @@ def _compile(n: int, k: int, tactic: GroupedGemmTactic, out: torch.Tensor):
         return make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
 
     c_fake = cute.runtime.from_dlpack(_c_view(out)).mark_layout_dynamic(leading_dim=1)
+    if gather_a:
+        compiled = cute.compile(
+            gemm.wrapper_gathered,
+            out.shape[0],
+            1,
+            n,
+            k,
+            1,
+            1,
+            ptr(cutlass.Float8E4M3FN),
+            ptr(cutlass.Float8E4M3FN),
+            ptr(cutlass.Float32),
+            ptr(cutlass.Float32),
+            ptr(cutlass.Int32, 4),
+            ptr(cutlass.Int32, 16),
+            c_fake,
+            max_active_clusters=max_active_clusters,
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+        _compiled_kernels[key] = compiled
+        return compiled
     compiled = cute.compile(
         gemm.wrapper_grouped,
         out.shape[0],
@@ -1796,6 +2035,68 @@ def grouped_blockwise_fp8_gemm(
         sfa.data_ptr(),
         sfb.data_ptr(),
         tile_expert.data_ptr(),
+        _c_view(out),
+    )
+    return out
+
+
+def grouped_blockwise_fp8_gemm_gathered(
+    x: torch.Tensor,
+    sfx: torch.Tensor,
+    row_index: torch.Tensor,
+    b: torch.Tensor,
+    sfb: torch.Tensor,
+    tile_expert: torch.Tensor,
+    out: torch.Tensor,
+    tactic: Union[GroupedGemmTactic, None] = None,
+) -> torch.Tensor:
+    """``grouped_blockwise_fp8_gemm`` with A read as ``x[row_index]``, without the copy.
+
+    Row ``r`` of the grouped operand is ``x[row_index[r]]`` with scales
+    ``sfx[:, row_index[r]]``. The TMA warp loads each A tile with ``tile::gather4`` (four
+    source rows per instruction) and the scale warp copies the matching scales, so the
+    result is bitwise the one of gathering ``x`` and ``sfx`` first.
+
+    Args:
+        x: ``[T, K]`` FP8 E4M3, the un-permuted activations, row-major.
+        sfx: ``[K / 128, T]`` FP32, their 1 x 128 scales, K-block-major (tokens contiguous;
+            the row stride may exceed ``T``).
+        row_index: ``[rows]`` Int32, the source row in ``x`` of every grouped row. Padding
+            rows may hold -1 (or any valid row); their output is don't-care.
+        b, sfb, tile_expert, out: as in ``grouped_blockwise_fp8_gemm``.
+        tactic: as in ``grouped_blockwise_fp8_gemm``; must be a 1-CTA 128-row tile.
+    """
+    num_tokens, k = x.shape
+    num_experts, n, k_b = b.shape
+    rows = out.shape[0]
+    if k_b != k or rows % GROUP_ROW_ALIGNMENT != 0:
+        raise ValueError(f"bad shapes: x {tuple(x.shape)}, b {tuple(b.shape)}, out {rows}")
+    if tuple(sfx.shape) != (k // 128, num_tokens) or sfx.stride(1) != 1:
+        raise ValueError(f"bad sfx: {tuple(sfx.shape)} strides {sfx.stride()}")
+    if tuple(sfb.shape) != (num_experts, n // 128, k // 128):
+        raise ValueError(f"bad sfb: {tuple(sfb.shape)}")
+    if row_index.numel() != rows or row_index.dtype != torch.int32:
+        raise ValueError("row_index must be Int32 with one entry per output row")
+    if tile_expert.numel() != rows // GROUP_ROW_ALIGNMENT or tile_expert.dtype != torch.int32:
+        raise ValueError("tile_expert must be Int32 with rows / 128 entries")
+    if tuple(out.shape) != (rows, n) or out.dtype != torch.bfloat16:
+        raise ValueError(f"bad output: {tuple(out.shape)} {out.dtype}")
+    if tactic is None:
+        tactic = DEFAULT_GATHERED_TACTICS.get((n, k), FALLBACK_TACTIC)
+    compiled = _compile(n, k, tactic, out, gather_a=True)
+    compiled(
+        rows,
+        num_tokens,
+        n,
+        k,
+        num_experts,
+        sfx.stride(0),
+        x.data_ptr(),
+        b.data_ptr(),
+        sfx.data_ptr(),
+        sfb.data_ptr(),
+        tile_expert.data_ptr(),
+        row_index.data_ptr(),
         _c_view(out),
     )
     return out

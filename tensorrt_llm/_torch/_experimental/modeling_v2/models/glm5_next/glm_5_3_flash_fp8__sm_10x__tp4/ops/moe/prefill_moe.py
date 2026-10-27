@@ -13,14 +13,15 @@ The launches, for ``T`` rows and top-8 routing:
   normalization and the routed scaling factor.
 * The expert counts and their 128-aligned segment starts, in torch, with no host
   synchronization. The buffers are sized for the worst case, ``8 T + 127 E`` rows.
-* ``gather``: takes each (row, slot) pair's destination row in its expert's segment with an
-  atomic increment, then copies the FP8 row and its scales there.
+* ``place``: takes each (row, slot) pair's destination row in its expert's segment with an
+  atomic increment and records the source row of every destination row.
 * The tile table: the expert of every 128-row tile (``searchsorted`` over the segment ends),
   -1 for tiles past an expert's rows; the GEMMs skip those.
-* FC1: ``grouped_blockwise_fp8_gemm``.
+* FC1: ``grouped_blockwise_fp8_gemm_gathered``, which loads each tile's rows from ``x``
+  through the source-row table (TMA ``gather4``) instead of a permuted copy.
 * ``act``: clamped SwiGLU of the ``[up; gate]`` product, then the 1 x 128 FP8 quantization
   of the intermediate (scale ``amax / 448``).
-* FC2: the same grouped GEMM.
+* FC2: ``grouped_blockwise_fp8_gemm`` on the intermediate, already in segment order.
 * ``combine``: each row's weighted sum of its eight slots, added to ``addend`` (the shared
   expert's output) in FP32 and stored as BF16.
 """
@@ -39,41 +40,33 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 )
 
 from .decode_moe import _topk_kernel
-from .grouped_blockwise_gemm import grouped_blockwise_fp8_gemm
+from .grouped_blockwise_gemm import grouped_blockwise_fp8_gemm, grouped_blockwise_fp8_gemm_gathered
 
 _TOPK = 8
 _ALIGN = 128
 _ACT_ROWS = 4
+_PLACE_BLOCK = 1024
 
 
 @triton.jit
-def _gather_kernel(
-    x_ptr,
-    xs_ptr,
-    xs_stride_row,
-    xs_stride_blk,
+def _place_kernel(
     ids_ptr,
     cursor_ptr,
     dest_ptr,
-    a_ptr,
-    as_ptr,
-    cap,
-    H: tl.constexpr,
+    row_index_ptr,
+    pairs,
     TOPK: tl.constexpr,
     SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    pair = tl.program_id(0)
+    pair = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = pair < pairs
     row = pair // TOPK
-    # The pair's row in its expert's segment; the order within a segment is arbitrary.
-    expert = tl.load(ids_ptr + row * SLOTS + pair % TOPK)
-    dest32 = tl.atomic_add(cursor_ptr + expert, 1)
-    tl.store(dest_ptr + pair, dest32)
-    dest = dest32.to(tl.int64)
-    words = tl.arange(0, H // 4)
-    tl.store(a_ptr + dest * (H // 4) + words, tl.load(x_ptr + row * (H // 4) + words))
-    blk = tl.arange(0, H // 128)
-    scale = tl.load(xs_ptr + row * xs_stride_row + blk * xs_stride_blk)
-    tl.store(as_ptr + blk * cap + dest, scale)
+    expert = tl.load(ids_ptr + row * SLOTS + pair % TOPK, mask=valid, other=0)
+    # Each pair's row in its expert's segment; the order within a segment is arbitrary.
+    dest = tl.atomic_add(cursor_ptr + expert, 1, mask=valid)
+    tl.store(dest_ptr + pair, dest, mask=valid)
+    tl.store(row_index_ptr + dest, row, mask=valid)
 
 
 @triton.jit
@@ -128,15 +121,50 @@ def _combine_kernel(
     tl.store(out_ptr + row * H + n, acc.to(tl.bfloat16))
 
 
+class _Workspace:
+    """The step's scratch, allocated once for the largest step seen and sliced after.
+
+    The scratch is about 0.13 MB per routed pair (2.2 GB at 16K tokens). Allocating it per
+    layer lets the caching allocator free and re-map device memory in the middle of a
+    step, and that synchronizes the device while the collectives of other ranks wait for
+    this rank, which can stall every rank. The first prefill (the warmup's
+    largest step) sizes the buffers, so the KV-cache budget accounts for them.
+    """
+
+    def __init__(self) -> None:
+        self.cap = 0
+        self.buffers: dict = {}
+
+    def get(self, cap: int, h: int, inter: int, device) -> dict:
+        if cap > self.cap or self.buffers.get("y") is None or self.buffers["y"].device != device:
+            self.buffers = {}
+            self.buffers = dict(
+                row_index=torch.empty(cap, dtype=torch.int32, device=device),
+                h1=torch.empty((cap, 2 * inter), dtype=torch.bfloat16, device=device),
+                act=torch.empty((cap, inter), dtype=torch.float8_e4m3fn, device=device),
+                act_scale=torch.empty((inter // 128, cap), dtype=torch.float32, device=device),
+                y=torch.empty((cap, h), dtype=torch.bfloat16, device=device),
+            )
+            self.cap = cap
+        b = self.buffers
+        return dict(
+            row_index=b["row_index"][:cap],
+            h1=b["h1"][:cap],
+            act=b["act"][:cap],
+            act_scale=b["act_scale"][:, :cap],
+            y=b["y"][:cap],
+        )
+
+
 class PrefillMoe(OpWrapper):
     """``addend + scaling * sum_i w_i * expert_{e_i}(x)`` for every row of a prefill step.
 
     ``x`` is the FP8 ``[T, H]`` row-wise 1 x 128 quantization of the rows with scales
-    ``x_scale`` (``[T, H/128]`` FP32, any strides). ``logits`` are the router's FP32
-    ``[T, E]`` outputs, ``bias`` the FP32 correction bias. ``w31`` / ``s31`` are the routed
-    experts' ``[E, 2I, H]`` FP8 ``[up; gate]`` weights and their ``[E, 2I/128, H/128]``
-    scales, ``w2`` / ``s2`` the ``[E, H, I]`` down weights and scales. ``addend`` is BF16
-    ``[T, H]``. Returns BF16 ``[T, H]``.
+    ``x_scale`` (``[H/128, T]`` FP32, K-block-major as ``fp8_quantize_1x128`` returns them).
+    ``logits`` are the router's FP32 ``[T, E]`` outputs, ``bias`` the FP32 correction bias.
+    ``w31`` / ``s31`` are the routed experts' ``[E, 2I, H]`` FP8 ``[up; gate]`` weights and
+    their ``[E, 2I/128, H/128]`` scales, ``w2`` / ``s2`` the ``[E, H, I]`` down weights and
+    scales. ``addend`` is BF16 ``[T, H]``. Returns BF16 ``[T, H]``.
     """
 
     ARCHS = frozenset({Arch.SM_100})
@@ -149,6 +177,8 @@ class PrefillMoe(OpWrapper):
         ),
         Cell(why="smallest sequence-parallel step", spec=dict(t=2048, e=288, h=4096, i=512)),
     )
+
+    _workspace = _Workspace()
 
     note = """
     The FC1 output is BF16 before the SwiGLU and the intermediate is requantized 1 x 128, as in
@@ -184,41 +214,24 @@ class PrefillMoe(OpWrapper):
         dest = torch.empty_like(flat)
 
         cap = (rows * _TOPK + num_experts * (_ALIGN - 1) + _ALIGN - 1) // _ALIGN * _ALIGN
-        a = torch.empty((cap, h), dtype=torch.float8_e4m3fn, device=dev)
-        a_scale = torch.empty((h // 128, cap), dtype=torch.float32, device=dev)
+        ws = self._workspace.get(cap, h, inter, dev)
+        row_index = ws["row_index"].fill_(-1)
         pairs = rows * _TOPK
-        _gather_kernel[(pairs,)](
-            x.view(torch.int32),
-            x_scale,
-            x_scale.stride(0),
-            x_scale.stride(1),
-            ids,
-            cursor,
-            dest,
-            a.view(torch.int32),
-            a_scale,
-            cap,
-            h,
-            _TOPK,
-            _TOPK + 1,
-            num_warps=4,
+        _place_kernel[(triton.cdiv(pairs, _PLACE_BLOCK),)](
+            ids, cursor, dest, row_index, pairs, _TOPK, _TOPK + 1, _PLACE_BLOCK, num_warps=4
         )
         tile_row = torch.arange(0, cap, _ALIGN, device=dev, dtype=torch.int32)
         tile_expert = torch.searchsorted(starts + padded, tile_row, right=True)
         tile_expert = tile_expert.clamp_(max=num_experts - 1).to(torch.int32)
         tile_expert = torch.where(tile_row < ends[tile_expert], tile_expert, -1)
-        h1 = torch.empty((cap, 2 * inter), dtype=torch.bfloat16, device=dev)
-        grouped_blockwise_fp8_gemm(a, a_scale, w31, s31, tile_expert, h1)
-        del a, a_scale
-        act = torch.empty((cap, inter), dtype=torch.float8_e4m3fn, device=dev)
-        act_scale = torch.empty((inter // 128, cap), dtype=torch.float32, device=dev)
+        h1 = ws["h1"]
+        grouped_blockwise_fp8_gemm_gathered(x, x_scale, row_index, w31, s31, tile_expert, h1)
+        act, act_scale = ws["act"], ws["act_scale"]
         _act_kernel[(triton.cdiv(pairs, _ACT_ROWS),)](
             h1, dest, act, act_scale, pairs, cap, limit, inter, inter // 128, _ACT_ROWS, num_warps=4
         )
-        del h1
-        y = torch.empty((cap, h), dtype=torch.bfloat16, device=dev)
+        y = ws["y"]
         grouped_blockwise_fp8_gemm(act, act_scale, w2, s2, tile_expert, y)
-        del act, act_scale
         out = torch.empty((rows, h), dtype=torch.bfloat16, device=dev)
         _combine_kernel[(rows, h // 512)](
             y, dest, wts, addend, out, h, _TOPK, _TOPK + 1, 512, num_warps=4
@@ -238,7 +251,7 @@ class PrefillMoe(OpWrapper):
 
         rows = x.shape[0]
         inter = w2.shape[2]
-        xf = (x.float().view(rows, -1, 128) * x_scale.float()[:, :, None]).view(rows, -1)
+        xf = (x.float().view(rows, -1, 128) * x_scale.float().t()[:, :, None]).view(rows, -1)
         out = addend.float().clone()
         with true_fp32_matmul():
             score = torch.sigmoid(logits.float())
@@ -258,7 +271,8 @@ class PrefillMoe(OpWrapper):
     def is_valid(self, x, x_scale, logits, bias, scaling, limit, w31, s31, w2, s2, addend):
         rows, h = x.shape
         assert x.dtype == torch.float8_e4m3fn and x.is_contiguous()
-        assert x_scale.dtype == torch.float32 and x_scale.shape == (rows, h // 128)
+        assert x_scale.dtype == torch.float32 and x_scale.shape == (h // 128, rows)
+        assert x_scale.stride(1) == 1
         assert logits.dtype == torch.float32 and logits.is_contiguous() and logits.shape[0] == rows
         assert bias.dtype == torch.float32
         for t in (w31, w2):
