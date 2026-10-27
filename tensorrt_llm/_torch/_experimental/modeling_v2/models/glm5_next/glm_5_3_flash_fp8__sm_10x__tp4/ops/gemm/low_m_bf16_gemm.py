@@ -128,10 +128,16 @@ class LowMBf16Gemm(OpWrapper):
         kernel, tactic = choice
         out = torch.empty((m, n), dtype=x.dtype, device=x.device)
         if kernel == "direct":
-            from flashinfer.gemm.kernels.dense_bf16_gemm_direct import DirectTactic, run_direct_dense
+            from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
+                DirectTactic,
+                run_direct_dense,
+            )
 
             return run_direct_dense(x, weight.t(), out, get_env_enable_pdl(), DirectTactic(*tactic))
-        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic, run_splitk_dense
+        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+            SplitKTactic,
+            run_splitk_dense,
+        )
 
         return run_splitk_dense(
             x, weight.t(), None, out, get_env_enable_pdl(), SplitKTactic(*tactic)

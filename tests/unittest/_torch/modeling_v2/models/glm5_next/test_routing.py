@@ -16,9 +16,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 pytestmark = pytest.mark.cpu_only
 
 _DUMMY_MODEL = "/tmp/dummy_model"
-_TARGET = (
-    "models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling.ModelingV2Glm53FlashFp8Sm10xTp4"
-)
+_TARGET = "models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling.ModelingV2Glm53FlashFp8Sm10xTp4"
 _TP4 = dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1, gpus_per_node=8)
 
 

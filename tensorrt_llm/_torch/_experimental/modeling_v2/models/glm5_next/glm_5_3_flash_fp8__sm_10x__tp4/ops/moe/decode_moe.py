@@ -37,8 +37,17 @@ _SLOTS = _TOPK + 1
 
 
 @triton.jit
-def _topk_kernel(logits_ptr, bias_ptr, ids_ptr, wts_ptr, scaling, E: tl.constexpr, EP: tl.constexpr,
-                 TOPK: tl.constexpr, SLOTS: tl.constexpr):
+def _topk_kernel(
+    logits_ptr,
+    bias_ptr,
+    ids_ptr,
+    wts_ptr,
+    scaling,
+    E: tl.constexpr,
+    EP: tl.constexpr,
+    TOPK: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
     row = tl.program_id(0)
     e = tl.arange(0, EP)
     valid = e < E
@@ -65,8 +74,21 @@ def _topk_kernel(logits_ptr, bias_ptr, ids_ptr, wts_ptr, scaling, E: tl.constexp
 
 
 @triton.jit
-def _fc1_kernel(x_ptr, ids_ptr, w_ptr, s_ptr, sw_ptr, ss_ptr, act_ptr, limit, H: tl.constexpr,
-                I: tl.constexpr, SLOTS: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _fc1_kernel(
+    x_ptr,
+    ids_ptr,
+    w_ptr,
+    s_ptr,
+    sw_ptr,
+    ss_ptr,
+    act_ptr,
+    limit,
+    H: tl.constexpr,
+    INTER: tl.constexpr,
+    SLOTS: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
     pair = tl.program_id(0)
     pid_n = tl.program_id(1)
     row = pair // SLOTS
@@ -76,46 +98,62 @@ def _fc1_kernel(x_ptr, ids_ptr, w_ptr, s_ptr, sw_ptr, ss_ptr, act_ptr, limit, H:
     n = pid_n * BN + tl.arange(0, BN)
     k = tl.arange(0, BK)
     # Routed [w3 (up); w1 (gate)] rows of expert e, or the shared expert's [up; gate] copy.
-    base = tl.where(shared, sw_ptr, w_ptr + tl.maximum(e, 0) * (2 * I * H))
-    sbase = tl.where(shared, ss_ptr, s_ptr + tl.maximum(e, 0) * (2 * I // 128) * (H // 128))
+    base = tl.where(shared, sw_ptr, w_ptr + tl.maximum(e, 0) * (2 * INTER * H))
+    sbase = tl.where(shared, ss_ptr, s_ptr + tl.maximum(e, 0) * (2 * INTER // 128) * (H // 128))
     up_row = base + n[:, None] * H
-    gate_row = up_row + I * H
+    gate_row = up_row + INTER * H
     s_up = sbase + (pid_n * BN // 128) * (H // 128)
-    s_gate = s_up + (I // 128) * (H // 128)
+    s_gate = s_up + (INTER // 128) * (H // 128)
     acc_u = tl.zeros((BN,), tl.float32)
     acc_g = tl.zeros((BN,), tl.float32)
     for kb in range(0, H, BK):
         x = tl.load(x_ptr + row * H + kb + k).to(tl.float32)
         su = tl.load(s_up + (kb + k) // 128)
         sg = tl.load(s_gate + (kb + k) // 128)
-        acc_u += tl.sum(tl.load(up_row + kb + k[None, :]).to(tl.float32) * (x * su)[None, :], axis=1)
-        acc_g += tl.sum(tl.load(gate_row + kb + k[None, :]).to(tl.float32) * (x * sg)[None, :], axis=1)
+        acc_u += tl.sum(
+            tl.load(up_row + kb + k[None, :]).to(tl.float32) * (x * su)[None, :], axis=1
+        )
+        acc_g += tl.sum(
+            tl.load(gate_row + kb + k[None, :]).to(tl.float32) * (x * sg)[None, :], axis=1
+        )
     # Released after the weight stream: earlier, the dependents' CTAs would occupy SMs this
     # multi-wave grid still needs.
     tl.extra.cuda.gdc_launch_dependents()
     g = tl.minimum(acc_g, limit)
     u = tl.minimum(tl.maximum(acc_u, -limit), limit)
-    tl.store(act_ptr + pair * I + n, g / (1.0 + tl.exp(-g)) * u)
+    tl.store(act_ptr + pair * INTER + n, g / (1.0 + tl.exp(-g)) * u)
 
 
 @triton.jit
-def _fc2_kernel(act_ptr, ids_ptr, wts_ptr, w_ptr, s_ptr, sw_ptr, ss_ptr, out_ptr, H: tl.constexpr,
-                I: tl.constexpr, SLOTS: tl.constexpr, BN: tl.constexpr):
+def _fc2_kernel(
+    act_ptr,
+    ids_ptr,
+    wts_ptr,
+    w_ptr,
+    s_ptr,
+    sw_ptr,
+    ss_ptr,
+    out_ptr,
+    H: tl.constexpr,
+    INTER: tl.constexpr,
+    SLOTS: tl.constexpr,
+    BN: tl.constexpr,
+):
     row = tl.program_id(0)
     pid_n = tl.program_id(1)
     n = pid_n * BN + tl.arange(0, BN)
-    j = tl.arange(0, I)
+    j = tl.arange(0, INTER)
     acc = tl.zeros((BN,), tl.float32)
     tl.extra.cuda.gdc_wait()
     for slot in range(SLOTS):
         pair = row * SLOTS + slot
         e = tl.load(ids_ptr + pair).to(tl.int64)
         shared = e < 0
-        base = tl.where(shared, sw_ptr, w_ptr + tl.maximum(e, 0) * (H * I))
-        sbase = tl.where(shared, ss_ptr, s_ptr + tl.maximum(e, 0) * (H // 128) * (I // 128))
-        a = tl.load(act_ptr + pair * I + j)
-        s = tl.load(sbase + (pid_n * BN // 128) * (I // 128) + j // 128)
-        w = tl.load(base + n[:, None] * I + j[None, :]).to(tl.float32)
+        base = tl.where(shared, sw_ptr, w_ptr + tl.maximum(e, 0) * (H * INTER))
+        sbase = tl.where(shared, ss_ptr, s_ptr + tl.maximum(e, 0) * (H // 128) * (INTER // 128))
+        a = tl.load(act_ptr + pair * INTER + j)
+        s = tl.load(sbase + (pid_n * BN // 128) * (INTER // 128) + j // 128)
+        w = tl.load(base + n[:, None] * INTER + j[None, :]).to(tl.float32)
         acc += tl.sum(w * (a * s)[None, :], axis=1) * tl.load(wts_ptr + pair)
     tl.extra.cuda.gdc_launch_dependents()
     tl.store(out_ptr + row * H + n, acc.to(tl.bfloat16))
@@ -153,16 +191,56 @@ class DecodeMoe(OpWrapper):
         ids = torch.empty((m, _SLOTS), dtype=torch.int32, device=x.device)
         wts = torch.empty((m, _SLOTS), dtype=torch.float32, device=x.device)
         pdl = get_env_enable_pdl()
-        _topk_kernel[(m,)](logits, bias, ids, wts, scaling, num_experts,
-                           triton.next_power_of_2(num_experts), _TOPK, _SLOTS, num_warps=4,
-                           launch_pdl=pdl)
+        _topk_kernel[(m,)](
+            logits,
+            bias,
+            ids,
+            wts,
+            scaling,
+            num_experts,
+            triton.next_power_of_2(num_experts),
+            _TOPK,
+            _SLOTS,
+            num_warps=4,
+            launch_pdl=pdl,
+        )
         act = torch.empty((m * _SLOTS, inter), dtype=torch.float32, device=x.device)
-        _fc1_kernel[(m * _SLOTS, inter // 32)](x, ids, w31, s31, sw31, ss31, act, limit, h, inter,
-                                               _SLOTS, 32, 512, num_warps=4, num_stages=3,
-                                               launch_pdl=pdl)
+        _fc1_kernel[(m * _SLOTS, inter // 32)](
+            x,
+            ids,
+            w31,
+            s31,
+            sw31,
+            ss31,
+            act,
+            limit,
+            h,
+            inter,
+            _SLOTS,
+            32,
+            512,
+            num_warps=4,
+            num_stages=3,
+            launch_pdl=pdl,
+        )
         out = torch.empty((m, h), dtype=torch.bfloat16, device=x.device)
-        _fc2_kernel[(m, h // 32)](act, ids, wts, w2, s2, sw2, ss2, out, h, inter, _SLOTS, 32,
-                                  num_warps=4, num_stages=3, launch_pdl=pdl)
+        _fc2_kernel[(m, h // 32)](
+            act,
+            ids,
+            wts,
+            w2,
+            s2,
+            sw2,
+            ss2,
+            out,
+            h,
+            inter,
+            _SLOTS,
+            32,
+            num_warps=4,
+            num_stages=3,
+            launch_pdl=pdl,
+        )
         return out
 
     def reference(self, x, logits, bias, scaling, limit, w31, s31, w2, s2, sw31, ss31, sw2, ss2):
@@ -195,7 +273,9 @@ class DecodeMoe(OpWrapper):
         m, h = x.shape
         assert 1 <= m <= MAX_ROWS, f"{m} rows; at most {MAX_ROWS}"
         assert x.dtype == torch.bfloat16 and x.is_contiguous()
-        assert logits.dtype == torch.float32 and logits.is_contiguous() and bias.dtype == torch.float32
+        assert (
+            logits.dtype == torch.float32 and logits.is_contiguous() and bias.dtype == torch.float32
+        )
         for t in (w31, w2, sw31, sw2):
             assert t.dtype == torch.float8_e4m3fn and t.is_contiguous()
         for t in (s31, s2, ss31, ss2):
