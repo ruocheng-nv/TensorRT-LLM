@@ -54,7 +54,6 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
 from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
-from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import extract_routing_params
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import mpi_disabled
@@ -64,6 +63,7 @@ from . import weights as _weights
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 from .ops.moe.decode_moe import MAX_ROWS as _DECODE_MOE_ROWS
 from .ops.moe.decode_moe import decode_moe
+from .ops.moe.prefill_moe import prefill_moe
 
 # The deployment this target is written for; route() selects it on the same facts,
 # and the constructor states them again for a direct construction.
@@ -194,19 +194,32 @@ class PrefillTarget:
         """The FFN's intermediate-split output for every row, from this rank's rows ``x``.
 
         Every FFN GEMM input is the 1 x 128 block-FP8 quantization of the row, a per-row
-        function: each rank quantizes its own rows (and runs the router GEMM on them), and
-        the gather moves FP8 rows, their scales and the router logits instead of BF16 rows
-        that every rank would quantize again, once for the routed and once for the shared
-        expert.
+        function: each rank quantizes its own rows (and runs the router GEMM on them), and the
+        gather moves FP8 rows, their scales and the router logits instead of BF16 rows that
+        every rank would quantize again. The routed experts run on ``prefill_moe``, which adds
+        the shared expert's output in its combine.
         """
         x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
         x_fp8 = self._gather(x_fp8.view(torch.uint8), num_tokens).view(torch.float8_e4m3fn)
-        # [hidden / 128, rows] K-block-major scales: gathered row-major, returned to that layout.
-        x_scale = self._gather(x_scale.t().contiguous(), num_tokens).t().contiguous()
+        # [rows, hidden / 128] scales for the grouped GEMMs; K-block-major for the dense ones.
+        row_scale = self._gather(x_scale.t().contiguous(), num_tokens)
+        x_scale = row_scale.t().contiguous()
         if isinstance(mlp, Glm5NextMoE):
             logits = self._gather(mlp.gate(x), num_tokens)
-            return _routed_from_fp8(mlp, x_fp8, x_scale, logits) + _gated_mlp_from_fp8(
-                mlp.shared_experts, x_fp8, x_scale
+            shared = _gated_mlp_from_fp8(mlp.shared_experts, x_fp8, x_scale)
+            backend = mlp.experts.backend
+            return prefill_moe(
+                x_fp8,
+                row_scale,
+                logits,
+                mlp.gate.e_score_correction_bias,
+                mlp.decode_scaling,
+                mlp.swiglu_limit,
+                backend.w3_w1_weight,
+                backend.w3_w1_weight_scaling_factor,
+                backend.w2_weight,
+                backend.w2_weight_scaling_factor,
+                shared,
             )
         return _gated_mlp_from_fp8(mlp, x_fp8, x_scale)
 
@@ -335,42 +348,6 @@ def _kda_partial(attn, hidden_states: torch.Tensor, attn_metadata: AttentionMeta
     if isinstance(core, _KdaPrequantizedCore):
         return attn.o_proj.forward_prequantized(core.activation, core.scale)
     return attn.o_proj(core.reshape(-1, attn.proj_size))
-
-
-def _routed_from_fp8(
-    mlp: Glm5NextMoE, x_fp8: torch.Tensor, x_scale: torch.Tensor, logits: torch.Tensor
-) -> torch.Tensor:
-    """The routed experts' intermediate-split output from pre-quantized rows: the
-    TRTLLM-Gen FP8 block-scale runner the MoE backend calls, with the same arguments."""
-    backend = mlp.experts.backend
-    assert backend.num_fused_shared_expert == 0
-    routing = extract_routing_params(backend.routing_method)
-    return backend.op_backend.run_fp8_block_scale_moe(
-        logits,
-        routing.routing_bias,
-        x_fp8,
-        x_scale,
-        backend.w3_w1_weight,
-        backend.w3_w1_weight_scaling_factor,
-        backend.w2_weight,
-        backend.w2_weight_scaling_factor,
-        backend.num_slots,
-        routing.top_k,
-        backend.num_fused_shared_expert,
-        routing.n_group,
-        routing.topk_group,
-        backend.intermediate_size_per_partition,
-        backend.slot_start,
-        backend.expert_size_per_partition,
-        routing.routed_scaling_factor,
-        backend.routing_method.routing_method_type,
-        topk_weights=None,
-        topk_ids=None,
-        gemm1_clamp_limit=backend.act_clamp,
-        output=None,
-        tune_max_num_tokens=backend.max_num_tokens,
-        use_dp=backend.use_dp,
-    )
 
 
 def _gated_mlp_from_fp8(mlp, x_fp8: torch.Tensor, x_scale: torch.Tensor) -> torch.Tensor:
