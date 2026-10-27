@@ -61,6 +61,13 @@ _CHOICES: Dict[Tuple[int, int], Tuple[Tuple[int, str, tuple], ...]] = {
         (16, "splitk", (64, 16, 2, 11)),
         (32, "splitk", (64, 32, 2, 9)),
     ),
+    # LM head, vocabulary-parallel: 154880 / 4 rows. The MTP draft heads run 1 row, verify 4 per request.
+    (38720, 4096): (
+        (1, "direct", (128, 1, 1)),
+        (2, "direct", (128, 2, 2)),
+        (8, "splitk", (128, 8, 2, 6)),
+        (16, "splitk", (64, 16, 1, 11)),
+    ),
     # Indexer wq_b (32 heads x 128) and MLA q_b (16 local heads x 256): both q_lora -> 4096.
     (4096, 1536): (
         (8, "splitk", (64, 8, 1, 12)),
@@ -107,6 +114,11 @@ class LowMBf16Gemm(OpWrapper):
         Cell(why="MLA [q_a | kv_a], one request", spec=dict(m=4, n=2048, k=4096)),
         Cell(why="MLA o_proj, one request", spec=dict(m=4, n=4096, k=4096)),
         Cell(why="MLA o_proj, MTP draft row", spec=dict(m=1, n=4096, k=4096)),
+        Cell(why="LM head shard, MTP draft row", spec=dict(m=1, n=38720, k=4096)),
+        Cell(why="LM head shard, verify of one request", spec=dict(m=4, n=38720, k=4096)),
+        Cell(
+            why="LM head shard beyond the table (24 rows): cuBLAS", spec=dict(m=24, n=38720, k=4096)
+        ),
         Cell(why="a shape outside the table: cuBLAS", spec=dict(m=4, n=6144, k=4096)),
     )
 

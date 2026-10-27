@@ -51,12 +51,13 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
     glm5_next_text_quant_config,
     resolve_glm5_next_schedule,
 )
-from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import extract_routing_params
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
 from tensorrt_llm._torch.speculative import SpecMetadata
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
@@ -171,9 +172,7 @@ class PrefillTarget:
                 norm_eps=layer.post_attention_layernorm.variance_epsilon,
             )
             del partial
-            full = self._gather(x, num_tokens)
-            partial = _mlp_partial(layer.mlp, full)
-            del full
+            partial = self._ffn_partial(layer.mlp, x, num_tokens)
             mlp_out = self._scatter(partial, rows)
             del partial
             if layer_idx + 1 < num_layers:
@@ -190,6 +189,26 @@ class PrefillTarget:
                 residual = layer.hc_ffn.post_mapping(mlp_out, residual, post, comb)
             del mlp_out
         return self._gather(core.collapse_streams(residual), num_tokens)
+
+    def _ffn_partial(self, mlp, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """The FFN's intermediate-split output for every row, from this rank's rows ``x``.
+
+        Every FFN GEMM input is the 1 x 128 block-FP8 quantization of the row, a per-row
+        function: each rank quantizes its own rows (and runs the router GEMM on them), and
+        the gather moves FP8 rows, their scales and the router logits instead of BF16 rows
+        that every rank would quantize again, once for the routed and once for the shared
+        expert.
+        """
+        x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
+        x_fp8 = self._gather(x_fp8.view(torch.uint8), num_tokens).view(torch.float8_e4m3fn)
+        # [hidden / 128, rows] K-block-major scales: gathered row-major, returned to that layout.
+        x_scale = self._gather(x_scale.t().contiguous(), num_tokens).t().contiguous()
+        if isinstance(mlp, Glm5NextMoE):
+            logits = self._gather(mlp.gate(x), num_tokens)
+            return _routed_from_fp8(mlp, x_fp8, x_scale, logits) + _gated_mlp_from_fp8(
+                mlp.shared_experts, x_fp8, x_scale
+            )
+        return _gated_mlp_from_fp8(mlp, x_fp8, x_scale)
 
     def _mla_partial(
         self,
@@ -243,9 +262,7 @@ class PrefillTarget:
         kpool = indexer.index_kpool
         sched = ctx.context_rows(kpool, hidden_states.device)
         # The cache holds every row, so the latent and indexer-key projections do too.
-        q_resid, latent, packed, index_weights = attn._project_attention_and_indexer(
-            hidden_states
-        )
+        q_resid, latent, packed, index_weights = attn._project_attention_and_indexer(hidden_states)
         backend.append_paged_state(
             latent, packed, sched.positions, metadata, request_ids=sched.request_ids
         )
@@ -320,13 +337,50 @@ def _kda_partial(attn, hidden_states: torch.Tensor, attn_metadata: AttentionMeta
     return attn.o_proj(core.reshape(-1, attn.proj_size))
 
 
-def _mlp_partial(mlp, hidden_states: torch.Tensor) -> torch.Tensor:
-    """The FFN's intermediate-split output, before its all-reduce: the routed plus the
-    shared expert partials, or a dense MLP built with ``reduce_output=False``."""
-    if isinstance(mlp, Glm5NextMoE):
-        routed = mlp.experts(hidden_states, mlp.gate(hidden_states))
-        return routed + mlp.shared_experts(hidden_states)
-    return mlp(hidden_states)
+def _routed_from_fp8(
+    mlp: Glm5NextMoE, x_fp8: torch.Tensor, x_scale: torch.Tensor, logits: torch.Tensor
+) -> torch.Tensor:
+    """The routed experts' intermediate-split output from pre-quantized rows: the
+    TRTLLM-Gen FP8 block-scale runner the MoE backend calls, with the same arguments."""
+    backend = mlp.experts.backend
+    assert backend.num_fused_shared_expert == 0
+    routing = extract_routing_params(backend.routing_method)
+    return backend.op_backend.run_fp8_block_scale_moe(
+        logits,
+        routing.routing_bias,
+        x_fp8,
+        x_scale,
+        backend.w3_w1_weight,
+        backend.w3_w1_weight_scaling_factor,
+        backend.w2_weight,
+        backend.w2_weight_scaling_factor,
+        backend.num_slots,
+        routing.top_k,
+        backend.num_fused_shared_expert,
+        routing.n_group,
+        routing.topk_group,
+        backend.intermediate_size_per_partition,
+        backend.slot_start,
+        backend.expert_size_per_partition,
+        routing.routed_scaling_factor,
+        backend.routing_method.routing_method_type,
+        topk_weights=None,
+        topk_ids=None,
+        gemm1_clamp_limit=backend.act_clamp,
+        output=None,
+        tune_max_num_tokens=backend.max_num_tokens,
+        use_dp=backend.use_dp,
+    )
+
+
+def _gated_mlp_from_fp8(mlp, x_fp8: torch.Tensor, x_scale: torch.Tensor) -> torch.Tensor:
+    """A block-FP8 ``GatedMLP`` (``reduce_output=False``) on pre-quantized rows: its
+    gate_up GEMM, its (clamped) SwiGLU and its down projection."""
+    gate_up = mlp.gate_up_proj
+    h1 = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+        x_fp8, gate_up.weight, x_scale, gate_up.weight_scale
+    )
+    return mlp.down_proj(mlp._apply_activation(h1))
 
 
 @dataclass
@@ -570,6 +624,26 @@ def _low_m_linear(module: torch.nn.Module) -> None:
     module.forward = forward
 
 
+def _low_m_lm_head(lm_head) -> None:
+    """Run the vocabulary-parallel LM head GEMM of at most ``_LOW_M_ROWS`` rows (the verify
+    logits and every MTP draft head) on ``low_m_bf16_gemm``; the head's gather and slicing
+    around it are unchanged."""
+    full_rank = lm_head.apply_linear
+
+    def apply_linear(input, bias, lora_params=None, layer_idx=None):
+        rows = input.reshape(-1, input.shape[-1])
+        if (
+            bias is not None
+            or lora_params is not None
+            or rows.shape[0] > _LOW_M_ROWS
+            or lm_head._writes_output_dtype()
+        ):
+            return full_rank(input, bias, lora_params, layer_idx)
+        return low_m_bf16_gemm(rows.contiguous(), lm_head.weight).view(*input.shape[:-1], -1)
+
+    lm_head.apply_linear = apply_linear
+
+
 def _use_low_m_projections(layer) -> None:
     attn = layer.self_attn
     if isinstance(attn, Glm5NextLinearAttention):
@@ -722,6 +796,10 @@ class Glm53FlashFp8Sm10xTp4ForCausalLM(Glm5NextForCausalLM):
     def post_load_weights(self) -> None:
         super().post_load_weights()
         self.model.post_load_weights()
+        if not getattr(self, "_lm_head_low_m", False):
+            assert self.lm_head.weight.dtype == torch.bfloat16
+            _low_m_lm_head(self.lm_head)
+            self._lm_head_low_m = True
 
 
 class ModelingV2Glm53FlashFp8Sm10xTp4(Glm5NextVLM):
