@@ -848,6 +848,12 @@ class Glm53FlashFp8Sm10xTp4Core(Glm5NextModel):
         # Every decoder layer, the MTP layer's included (it is appended to ``self.layers``).
         for layer in self.layers:
             _use_low_m_projections(layer)
+            if getattr(layer, "attention_type", None) == LINEAR_ATTENTION:
+                # KDA prefill runs the persistent engine. The auto router picks the
+                # chunk-decomposed route whenever 2 * sequences * heads fits the SMs, and
+                # that route's chain kernel can stall one CTA on its mbarrier pipeline
+                # under serving load, which hangs every rank at the next collective.
+                layer.self_attn._dispatch.prefill_mode = "engine"
             if isinstance(getattr(layer, "mlp", None), Glm5NextMoE):
                 _use_decode_moe(layer.mlp, float(self.config.routed_scaling_factor))
         self._prefill = PrefillTarget(self)
