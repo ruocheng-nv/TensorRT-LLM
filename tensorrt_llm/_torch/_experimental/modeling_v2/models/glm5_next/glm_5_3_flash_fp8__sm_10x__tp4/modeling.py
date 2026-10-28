@@ -26,7 +26,6 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     compact_sparse_rows,
-    kpool_expand,
     kpool_score,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -57,6 +56,7 @@ from tensorrt_llm.logger import logger
 
 from . import weights as _weights
 from .ops.attention.head_major import quantize_1x128, saturate_fp8
+from .ops.attention.kpool_select import kpool_select
 from .ops.attention.latent_values import latent_values
 from .ops.attention.mla_prologue import mla_prologue
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
@@ -368,6 +368,15 @@ def _sparse_attention_fp8(backend, query: torch.Tensor, topk_rows: torch.Tensor,
     ``[R, H, kv_lora]``: the kernel and arguments of ``backend.forward``, without its
     saturating query cast (the caller's) or its zeroing of rows that selected no key
     (returned as ``nonempty`` for the caller to apply to a smaller tensor)."""
+    packed, lengths, nonempty = compact_sparse_rows(topk_rows)
+    return _sparse_attention_fp8_packed(backend, query, packed, lengths, metadata), nonempty
+
+
+def _sparse_attention_fp8_packed(
+    backend, query: torch.Tensor, packed: torch.Tensor, lengths: torch.Tensor, metadata
+) -> torch.Tensor:
+    """:func:`_sparse_attention_fp8` on latent rows already packed per query row (the layout of
+    ``compact_sparse_rows``)."""
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     state = backend._cache_state(metadata)
@@ -385,7 +394,6 @@ def _sparse_attention_fp8(backend, query: torch.Tensor, topk_rows: torch.Tensor,
     bmm1_scale = backend._native_bmm1_scale
     if bmm1_scale is None:
         bmm1_scale = backend.kv_scale_quant_orig * backend.softmax_scale
-    packed, lengths, nonempty = compact_sparse_rows(topk_rows)
     output = trtllm_batch_decode_with_kv_cache_mla(
         query=query.unsqueeze(1),
         kv_cache=kv_rows.view(-1, 1, 32, 512),
@@ -404,7 +412,7 @@ def _sparse_attention_fp8(backend, query: torch.Tensor, topk_rows: torch.Tensor,
         multi_ctas_kv_counter_buffer=native._counter,
         use_fp16_softmax=False,
     ).squeeze(1)
-    return output, nonempty
+    return output
 
 
 def _kda_partial(attn, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata):
@@ -542,12 +550,12 @@ def _mla_verify(
 
     The two input GEMMs run on two streams and ``mla_prologue`` applies the norms and writes
     the latent and indexer cache rows in one launch. Then two independent branches run on
-    two streams: the query
-    branch (q_b, the absorbed key projection, the saturating FP8 cast of the latent
-    query) on ``aux_stream``, and the cache / selection branch (latent and indexer-key
-    appends, pool scoring, top-k, row expansion) on the calling stream. The sparse
-    attention reads the FP8 query directly, and ``latent_values`` writes the value
-    projection row-major for o_proj, zero for rows that selected no key."""
+    two streams: the query branch (q_b, the absorbed key projection, the saturating FP8
+    cast of the latent query) on ``aux_stream``, and the selection branch (pool-key update,
+    pool scoring, then ``kpool_select``: top-k, row expansion and packing in one launch) on
+    the calling stream. The sparse attention reads the FP8 query directly, and
+    ``latent_values`` writes the value projection row-major for o_proj, zero for rows that
+    selected no key."""
     indexer = attn.indexer
     backend = attn.attn_backend
     metadata = ctx.metadata
@@ -604,30 +612,23 @@ def _mla_verify(
             w_scale=indexer.head_mix_scale,
             precision="bf16",
         )
-        selected = torch.empty(num_rows, indexer.select_k, dtype=torch.int32, device=scores.device)
-        indexer.pool_top_k(
-            scores,
-            selected,
-            is_prefill=False,
-            sequence_lengths=sched.num_cand,
-            scan_lengths=sched.num_cand,
-        )
         _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
-        return kpool_expand(
-            selected,
+        return kpool_select(
+            scores,
             sched.visible,
             sched.tables,
             state.tokens_per_block,
+            select_k=indexer.select_k,
+            kpool=params.index_kpool,
             base_row=base_row,
             rows_per_slot=rows_per_slot,
-            kpool=params.index_kpool,
             out_width=params.kernel_output_width,
         )
 
-    topk_rows, query_fp8 = maybe_execute_in_parallel(
+    (packed, lengths, nonempty), query_fp8 = maybe_execute_in_parallel(
         selection_branch, query_branch, events[0], events[1], aux_stream
     )
-    out_latent, nonempty = _sparse_attention_fp8(backend, query_fp8, topk_rows, metadata)
+    out_latent = _sparse_attention_fp8_packed(backend, query_fp8, packed, lengths, metadata)
     per_head = out_latent.view(num_rows, attn.num_heads, attn.kv_lora_rank)
     # Rows that selected no key get zero values, so o_proj gives them zero.
     out = attn.o_proj(latent_values(per_head, w_v_t, nonempty))

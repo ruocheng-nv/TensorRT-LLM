@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for the glm5_next fp8 tp4 MLA decode entries mla_prologue and latent_values."""
+"""GPU tests for the glm5_next fp8 tp4 MLA decode entries mla_prologue, kpool_select and
+latent_values."""
 
 import zlib
 
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.attention.kpool_select import (  # noqa: E501
+    kpool_select,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.ops.attention.latent_values import (  # noqa: E501
     latent_values,
 )
@@ -95,3 +99,25 @@ def test_latent_values_matches_reference(cell, certifying):  # noqa: F811
     ref = latent_values.reference(latent, w_v_t, keep)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out.float(), ref.float(), rtol=2**-7, atol=1e-3)
+
+
+@pytest.mark.parametrize("cell", kpool_select.CELLS, ids=[c.why[:44] for c in kpool_select.CELLS])
+def test_kpool_select_matches_reference(cell, certifying):  # noqa: F811
+    """Packed rows, lengths and the nonempty mask equal top-k + expand + compaction of the pools
+    sorted by index; the last row sees no key."""
+    certifying(kpool_select)
+    spec = cell.spec
+    g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    rows, tpb, kpool = spec["rows"], 32, 4
+    blocks = spec["pools"] * kpool // tpb
+    tables = torch.randperm(2 * blocks, generator=g, device="cuda")[:blocks].repeat(rows, 1)
+    kv_lens = spec["kv"] - torch.arange(rows, device="cuda").flip(0) % 4
+    kv_lens[-1] = 0
+    scores = torch.randn(rows, spec["pools"], generator=g, device="cuda")
+    args = (scores, kv_lens, tables, tpb)
+    kwargs = dict(select_k=512, kpool=kpool, base_row=3, rows_per_slot=384, out_width=2051)
+    kpool_select.is_valid(*args, **kwargs)
+    out = kpool_select(*args, **kwargs)
+    ref = kpool_select.reference(*args, **kwargs)
+    for got, want in zip(out, ref):
+        assert torch.equal(got, want)
