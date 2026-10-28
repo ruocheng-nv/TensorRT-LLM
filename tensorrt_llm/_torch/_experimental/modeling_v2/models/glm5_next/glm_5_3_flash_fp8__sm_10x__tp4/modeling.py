@@ -57,6 +57,8 @@ from tensorrt_llm.logger import logger
 
 from . import weights as _weights
 from .ops.attention.head_major import quantize_1x128, saturate_fp8
+from .ops.attention.latent_values import latent_values
+from .ops.attention.mla_prologue import mla_prologue
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 from .ops.moe.decode_moe import MAX_ROWS as _DECODE_MOE_ROWS
 from .ops.moe.decode_moe import decode_moe
@@ -538,18 +540,45 @@ def _mla_verify(
 ) -> torch.Tensor:
     """``Glm5NextSparseAttention.forward_verify`` and its all-reduce on the step's schedule.
 
-    After the input projections two independent branches run on two streams: the query
+    The two input GEMMs run on two streams and ``mla_prologue`` applies the norms and writes
+    the latent and indexer cache rows in one launch. Then two independent branches run on
+    two streams: the query
     branch (q_b, the absorbed key projection, the saturating FP8 cast of the latent
     query) on ``aux_stream``, and the cache / selection branch (latent and indexer-key
     appends, pool scoring, top-k, row expansion) on the calling stream. The sparse
-    attention reads the FP8 query directly; rows that selected no key are zeroed after
-    o_proj, on [rows, hidden] instead of the [rows, heads, kv_lora] latent."""
+    attention reads the FP8 query directly, and ``latent_values`` writes the value
+    projection row-major for o_proj, zero for rows that selected no key."""
     indexer = attn.indexer
     backend = attn.attn_backend
     metadata = ctx.metadata
-    batch, tokens = sched.positions.shape
-    num_rows = batch * tokens
-    q_resid, latent, packed, index_weights = attn._project_attention_and_indexer(hidden_states)
+    num_rows = sched.positions.numel()
+    # The two input GEMMs (attention q_a / kv_a and indexer key / gate / weights) on two
+    # streams, then one launch for the norms and the latent / indexer cache writes.
+    qa_kva, idx_out = maybe_execute_in_parallel(
+        lambda: attn.kv_a_proj_with_mqa(hidden_states),
+        lambda: indexer.wk_gate_wp(hidden_states),
+        events[0],
+        events[1],
+        aux_stream,
+    )
+    state = backend._cache_state(metadata)
+    q_resid = mla_prologue(
+        qa_kva,
+        idx_out,
+        attn.q_a_layernorm.weight,
+        attn.kv_a_layernorm.weight,
+        indexer.k_norm.weight,
+        indexer.k_norm.bias,
+        attn.q_a_layernorm.variance_epsilon,
+        indexer.k_norm.variance_epsilon,
+        sched.positions,
+        state.block_tables[state.num_contexts :],
+        state.latent_pool,
+        state.index_pool,
+        state.tokens_per_block,
+        backend.kv_scale_orig_quant,
+    )
+    index_weights = idx_out[:, 2 * indexer.head_dim :]
     w_k, w_v_t = attn.absorbed_kv_b()
 
     def query_branch() -> torch.Tensor:
@@ -557,15 +586,8 @@ def _mla_verify(
         return saturate_fp8(torch.bmm(query.transpose(0, 1), w_k))
 
     def selection_branch() -> torch.Tensor:
-        backend.append_paged_state(
-            latent.view(batch, tokens, -1),
-            packed.view(batch, tokens, -1),
-            sched.positions,
-            metadata,
-        )
         backend.update_pool_keys(sched.positions, indexer.index_kpool_compress_ape, metadata)
         q_index = indexer.wq_b(q_resid).view(num_rows, indexer.n_heads, indexer.head_dim)
-        state = backend._cache_state(metadata)
         params = backend.sparse_params
         capacity = state.block_tables.shape[1] * state.tokens_per_block
         scores = kpool_score(
@@ -607,9 +629,8 @@ def _mla_verify(
     )
     out_latent, nonempty = _sparse_attention_fp8(backend, query_fp8, topk_rows, metadata)
     per_head = out_latent.view(num_rows, attn.num_heads, attn.kv_lora_rank)
-    values = torch.bmm(per_head.transpose(0, 1), w_v_t)  # [heads, rows, v_head]
-    out = attn.o_proj(values.transpose(0, 1).reshape(num_rows, -1))
-    out = torch.where(nonempty[:, None], out, 0)
+    # Rows that selected no key get zero values, so o_proj gives them zero.
+    out = attn.o_proj(latent_values(per_head, w_v_t, nonempty))
     return out if attn.tp_all_reduce is None else attn.tp_all_reduce(out)
 
 
