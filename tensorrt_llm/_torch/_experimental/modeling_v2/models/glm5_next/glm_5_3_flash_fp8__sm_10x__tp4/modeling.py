@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     compact_sparse_rows,
     kpool_score,
 )
+from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_glm5_next import (
@@ -49,6 +50,7 @@ from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import mpi_disabled
@@ -59,6 +61,8 @@ from .ops.attention.head_major import quantize_1x128, saturate_fp8
 from .ops.attention.kpool_select import kpool_select
 from .ops.attention.latent_values import latent_values
 from .ops.attention.mla_prologue import mla_prologue
+from .ops.comm.mhc_ar_boundary import WORLD as _FUSED_BOUNDARY_WORLD
+from .ops.comm.mhc_ar_boundary import mhc_ar_boundary
 from .ops.gemm.low_m_bf16_gemm import low_m_bf16_gemm
 from .ops.moe.decode_moe import MAX_ROWS as _DECODE_MOE_ROWS
 from .ops.moe.decode_moe import decode_moe
@@ -504,23 +508,63 @@ class DecodeTarget:
         residual = core.expand_streams(inputs_embeds)
         post, comb, x = first.hc_attn.pre_mapping(residual)
         x = first.input_layernorm(x)
+        # Steps the decode MoE kernel takes end their blocks unreduced: each TP partial goes
+        # straight to the all-reduce fused with the next mHC boundary.
+        mapping = core.model_config.mapping
+        fused = x.shape[0] <= _DECODE_MOE_ROWS and mapping.tp_size == _FUSED_BOUNDARY_WORLD
+        if fused:
+            workspace, rank = get_allreduce_workspace(mapping), mapping.tp_rank
         for layer_idx in range(num_layers):
             layer = core.layers[layer_idx]
+            reduced = True
             if layer.attention_type == LINEAR_ATTENTION:
-                attn_out = layer.self_attn(x, attn_metadata)
+                if fused:
+                    attn_out, reduced = layer.self_attn.forward_partial(x, attn_metadata)
+                else:
+                    attn_out = layer.self_attn(x, attn_metadata)
             else:
                 if sched is None:
                     sched = _VerifySchedule.build(ctx, layer.self_attn.indexer.index_kpool)
-                attn_out = _mla_verify(layer.self_attn, x, ctx, sched, self.aux_stream, self.events)
-            residual, post, comb, x = layer.hc_ffn.fused_hc(
-                attn_out,
-                residual,
-                post,
-                comb,
-                norm_weight=layer.post_attention_layernorm.weight,
-                norm_eps=layer.post_attention_layernorm.variance_epsilon,
-            )
+                attn_out = _mla_verify(
+                    layer.self_attn, x, ctx, sched, self.aux_stream, self.events, reduce=not fused
+                )
+                reduced = not fused or layer.self_attn.tp_all_reduce is None
+            if reduced:
+                residual, post, comb, x = layer.hc_ffn.fused_hc(
+                    attn_out,
+                    residual,
+                    post,
+                    comb,
+                    norm_weight=layer.post_attention_layernorm.weight,
+                    norm_eps=layer.post_attention_layernorm.variance_epsilon,
+                )
+            else:
+                residual, post, comb, x = _fused_boundary(
+                    attn_out,
+                    residual,
+                    post,
+                    comb,
+                    layer.hc_ffn,
+                    layer.post_attention_layernorm,
+                    workspace,
+                    rank,
+                )
             del attn_out
+            if fused and layer_idx + 1 < num_layers and isinstance(layer.mlp, _DecodeMoe):
+                nxt = core.layers[layer_idx + 1]
+                partial = layer.mlp.forward_partial(x.reshape(-1, layer.mlp.hidden_size))
+                residual, post, comb, x = _fused_boundary(
+                    partial,
+                    residual,
+                    post,
+                    comb,
+                    nxt.hc_attn,
+                    nxt.input_layernorm,
+                    workspace,
+                    rank,
+                )
+                del partial
+                continue
             mlp_out = layer.run_mlp(x, None)
             if layer_idx + 1 < num_layers:
                 nxt = core.layers[layer_idx + 1]
@@ -538,6 +582,31 @@ class DecodeTarget:
         return core.collapse_streams(residual)
 
 
+def _fused_boundary(partial, residual, post, comb, hc, norm, workspace, rank):
+    """What ``hc.fused_hc(allreduce(partial), residual, post, comb, norm_weight=norm.weight,
+    norm_eps=norm.variance_epsilon)`` returns, with the TP all-reduce of ``partial`` fused in."""
+    rows, mult = residual.shape[0], hc.mult
+    residual_out, post_out, comb_out, layer_input = mhc_ar_boundary(
+        partial,
+        workspace,
+        rank,
+        residual.reshape(rows, mult, -1),
+        post.reshape(rows, mult),
+        comb.reshape(rows, mult, mult),
+        hc.fn,
+        hc.scale,
+        hc.base,
+        norm.weight,
+        hc.sinkhorn_iters,
+        hc.norm_eps,
+        hc.eps,
+        hc.sinkhorn_eps,
+        hc.post_mult_value,
+        norm.variance_epsilon,
+    )
+    return residual_out.view_as(residual), post_out.view(rows, mult, 1), comb_out, layer_input
+
+
 def _mla_verify(
     attn: Glm5NextSparseAttention,
     hidden_states: torch.Tensor,
@@ -545,6 +614,7 @@ def _mla_verify(
     sched: _VerifySchedule,
     aux_stream: torch.cuda.Stream,
     events: tuple,
+    reduce: bool = True,
 ) -> torch.Tensor:
     """``Glm5NextSparseAttention.forward_verify`` and its all-reduce on the step's schedule.
 
@@ -632,7 +702,7 @@ def _mla_verify(
     per_head = out_latent.view(num_rows, attn.num_heads, attn.kv_lora_rank)
     # Rows that selected no key get zero values, so o_proj gives them zero.
     out = attn.o_proj(latent_values(per_head, w_v_t, nonempty))
-    return out if attn.tp_all_reduce is None else attn.tp_all_reduce(out)
+    return out if attn.tp_all_reduce is None or not reduce else attn.tp_all_reduce(out)
 
 
 # Decode rows (MTP-3 verify of up to eight requests); prefill keeps the module GEMMs.
@@ -661,15 +731,26 @@ class _KdaLowMProjections(Glm5NextLinearAttention):
         return beta, gates[0].reshape(*lead, -1), gates[1].reshape(*lead, -1)
 
     def _project_output(self, core) -> torch.Tensor:
+        out, reduced = self._project_output_partial(core)
+        return out if reduced else self._o_allreduce(out)
+
+    def _project_output_partial(self, core) -> tuple[torch.Tensor, bool]:
+        """The output projection and whether its rows are already reduced over the TP group."""
         if isinstance(core, _KdaPrequantizedCore):
-            return super()._project_output(core)
+            return super()._project_output(core), True
         flat = core.reshape(-1, self.proj_size)
         if flat.shape[0] > _LOW_M_ROWS:
-            return super()._project_output(core)
-        out = low_m_bf16_gemm(flat, self.o_proj.weight)
-        if self._o_allreduce is not None:
-            out = self._o_allreduce(out)
-        return out
+            return super()._project_output(core), True
+        return low_m_bf16_gemm(flat, self.o_proj.weight), self._o_allreduce is None
+
+    def forward_partial(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> tuple[torch.Tensor, bool]:
+        """``forward`` with the low-M output projection's TP partial left unreduced, for the
+        caller's fused all-reduce; the flag says whether the returned rows are already reduced."""
+        if self.register_to_config and is_in_breakable_cuda_graph():
+            return self(hidden_states, attn_metadata), True
+        return self._project_output_partial(self._forward_impl(hidden_states, attn_metadata))
 
 
 def _bf16_weight(linear: torch.nn.Module) -> torch.Tensor:
@@ -774,6 +855,23 @@ class _DecodeMoe(Glm5NextMoE):
         if self.moe_all_reduce is not None:
             out = self.moe_all_reduce(out)
         return out.view_as(x)
+
+    def forward_partial(self, flat: torch.Tensor) -> torch.Tensor:
+        """The rows of a step of at most 4 rows before the TP all-reduce, for the caller's fused
+        all-reduce."""
+        backend = self.experts.backend
+        return decode_moe(
+            flat.contiguous(),
+            self.gate(flat),
+            self.gate.e_score_correction_bias,
+            self.decode_scaling,
+            self.swiglu_limit,
+            backend.w3_w1_weight,
+            backend.w3_w1_weight_scaling_factor,
+            backend.w2_weight,
+            backend.w2_weight_scaling_factor,
+            *self.decode_shared,
+        )
 
 
 @torch.no_grad()
