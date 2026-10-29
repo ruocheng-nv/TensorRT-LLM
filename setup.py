@@ -207,6 +207,8 @@ else:
     ]
 
 package_data += [
+    # CUDA sources a ModelingV2 target compiles at first use
+    '_torch/_experimental/modeling_v2/models/*/*/kernels/csrc/**/*',
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',

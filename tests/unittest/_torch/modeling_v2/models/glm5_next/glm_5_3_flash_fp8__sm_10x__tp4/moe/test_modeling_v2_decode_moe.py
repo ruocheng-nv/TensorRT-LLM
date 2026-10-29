@@ -71,6 +71,17 @@ def test_clamp_is_applied() -> None:
     _compare(op(*args), op.reference(*args))
 
 
+def test_independent_rows() -> None:
+    """Rows routed on their own logits with a nonzero correction bias: the step reads ~30 distinct
+    experts (the kernels stream each once), and the bias picks the experts but not their weights."""
+    spec = op.CELLS[1].spec
+    args = list(_build(spec, seed=13))
+    g = torch.Generator(device="cuda").manual_seed(14)
+    args[1] = torch.randn(spec["m"], spec["e"], generator=g, device="cuda")
+    args[2] = (torch.rand(spec["e"], generator=g, device="cuda") - 0.5) * 0.1
+    _compare(op(*args), op.reference(*args))
+
+
 def test_cuda_graph_capture_and_replay() -> None:
     spec = op.CELLS[1].spec
     args = _build(spec, seed=31)

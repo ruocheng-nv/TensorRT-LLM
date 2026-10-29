@@ -9,8 +9,8 @@ in about two thirds of the TRTLLM-Gen FP8 MoE's time.
 
 The launches, for ``T`` rows and top-8 routing:
 
-* ``topk`` (the decode MoE's routing kernel): sigmoid scores, FP32 correction bias, top-8,
-  normalization and the routed scaling factor.
+* ``topk``: sigmoid scores, FP32 correction bias, top-8 (ties to the lower expert index),
+  normalization and the routed scaling factor, one program per row.
 * The expert counts and their 128-aligned segment starts, in torch, with no host
   synchronization. The buffers are sized for the worst case, ``8 T + 127 E`` rows.
 * ``place``: takes each (row, slot) pair's destination row in its expert's segment with an
@@ -39,13 +39,49 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     true_fp32_matmul,
 )
 
-from .decode_moe import _topk_kernel
 from .grouped_blockwise_gemm import grouped_blockwise_fp8_gemm, grouped_blockwise_fp8_gemm_gathered
 
 _TOPK = 8
 _ALIGN = 128
 _ACT_ROWS = 4
 _PLACE_BLOCK = 1024
+
+
+@triton.jit
+def _topk_kernel(
+    logits_ptr,
+    bias_ptr,
+    ids_ptr,
+    wts_ptr,
+    scaling,
+    E: tl.constexpr,
+    EP: tl.constexpr,
+    TOPK: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    e = tl.arange(0, EP)
+    valid = e < E
+    # PDL: let the next launch start, then wait for the router GEMM's logits.
+    tl.extra.cuda.gdc_launch_dependents()
+    tl.extra.cuda.gdc_wait()
+    logit = tl.load(logits_ptr + row * E + e, mask=valid, other=0.0).to(tl.float32)
+    score = 1.0 / (1.0 + tl.exp(-logit))
+    choice = tl.where(valid, score + tl.load(bias_ptr + e, mask=valid, other=0.0), float("-inf"))
+    total = 0.0
+    for i in tl.static_range(TOPK):
+        best = tl.max(choice, axis=0)
+        idx = tl.min(tl.where(choice == best, e, EP), axis=0)
+        w = tl.sum(tl.where(e == idx, score, 0.0), axis=0)
+        tl.store(ids_ptr + row * SLOTS + i, idx)
+        tl.store(wts_ptr + row * SLOTS + i, w)
+        total += w
+        choice = tl.where(e == idx, float("-inf"), choice)
+    for i in tl.static_range(TOPK):
+        w = tl.load(wts_ptr + row * SLOTS + i)
+        tl.store(wts_ptr + row * SLOTS + i, w / total * scaling)
+    tl.store(ids_ptr + row * SLOTS + TOPK, -1)
+    tl.store(wts_ptr + row * SLOTS + TOPK, 1.0)
 
 
 @triton.jit

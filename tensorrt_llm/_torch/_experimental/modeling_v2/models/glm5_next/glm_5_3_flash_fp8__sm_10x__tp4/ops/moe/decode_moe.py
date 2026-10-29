@@ -1,27 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MoE branch of a decode step of at most 4 rows in three Triton launches (after the router GEMM).
+"""The MoE branch of a decode step of at most 4 rows in two CUDA launches (after the router GEMM).
 
-``topk``: sigmoid scores, FP32 correction bias, top-8, normalization and the routed scaling
-factor, one program per row. ``fc1``: one program per (row, expert slot, 32-wide block of the
-intermediate) computes the up and gate products of the block-FP8 weight with the BF16 row in
-FP32 (each 128 x 128 weight block times its scale) and the clamped SwiGLU. Slot 8 is the
-shared expert, weight 1. ``fc2``: one program per (row, 32-wide block of the hidden) sums the
-nine slots' down products, each weighted, and stores BF16. The rank's result is the moe_tp
-partial the caller all-reduces.
+``fc1`` (persistent, one CTA per SM) computes the routing in every CTA (sigmoid scores, FP32
+correction bias, top-8, normalized weights times the routed scaling factor, the shared expert as
+a ninth slot of weight 1) and the distinct experts of the step, then streams each distinct
+expert's up and gate rows once from HBM in 32 KB TMA bulk copies, multiplies them with the BF16
+rows on the tensor cores (e4m3 and BF16 both convert to f16 exactly; FP32 accumulation, each
+128 x 128 block's partial times its scale) and applies the clamped SwiGLU and the routing weight.
+``fc2`` (one CTA per 32 output columns) streams each distinct expert's down-projection tile and
+sums the experts in FP32 before the single BF16 rounding. The rank's result is the moe_tp
+partial the caller all-reduces. The kernels are in ``kernels/csrc/kernels/decode_moe.cu``.
 
-The BF16 activations are never quantized, so this computes the reference product more
-closely than the FP8-activation grouped GEMM it replaces at these sizes. All three launches use
-programmatic dependent launch (``TRTLLM_ENABLE_PDL``): each waits for its predecessor before
-reading what that predecessor wrote; the top-k releases its dependents at once, FC1 and FC2
-(several waves each) only after their weight streams.
+The BF16 activations are never quantized: the FC1 -> FC2 activations travel as an f16 hi / lo
+pair, so this computes the reference product more closely than the FP8-activation grouped GEMM
+it replaces at these sizes. Both launches use programmatic dependent launch
+(``TRTLLM_ENABLE_PDL``): ``fc1`` reads the rows and logits only after its grid-dependency wait,
+``fc2`` the activations only after its own.
 """
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
@@ -31,136 +31,17 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 )
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
+from ...kernels._lib import ops
+
 MAX_ROWS = 4
 _TOPK = 8
 _SLOTS = _TOPK + 1
-
-
-@triton.jit
-def _topk_kernel(
-    logits_ptr,
-    bias_ptr,
-    ids_ptr,
-    wts_ptr,
-    scaling,
-    E: tl.constexpr,
-    EP: tl.constexpr,
-    TOPK: tl.constexpr,
-    SLOTS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    e = tl.arange(0, EP)
-    valid = e < E
-    # PDL: let the next launch start, then wait for the router GEMM's logits.
-    tl.extra.cuda.gdc_launch_dependents()
-    tl.extra.cuda.gdc_wait()
-    logit = tl.load(logits_ptr + row * E + e, mask=valid, other=0.0).to(tl.float32)
-    score = 1.0 / (1.0 + tl.exp(-logit))
-    choice = tl.where(valid, score + tl.load(bias_ptr + e, mask=valid, other=0.0), float("-inf"))
-    total = 0.0
-    for i in tl.static_range(TOPK):
-        best = tl.max(choice, axis=0)
-        idx = tl.min(tl.where(choice == best, e, EP), axis=0)
-        w = tl.sum(tl.where(e == idx, score, 0.0), axis=0)
-        tl.store(ids_ptr + row * SLOTS + i, idx)
-        tl.store(wts_ptr + row * SLOTS + i, w)
-        total += w
-        choice = tl.where(e == idx, float("-inf"), choice)
-    for i in tl.static_range(TOPK):
-        w = tl.load(wts_ptr + row * SLOTS + i)
-        tl.store(wts_ptr + row * SLOTS + i, w / total * scaling)
-    tl.store(ids_ptr + row * SLOTS + TOPK, -1)
-    tl.store(wts_ptr + row * SLOTS + TOPK, 1.0)
-
-
-@triton.jit
-def _fc1_kernel(
-    x_ptr,
-    ids_ptr,
-    w_ptr,
-    s_ptr,
-    sw_ptr,
-    ss_ptr,
-    act_ptr,
-    limit,
-    H: tl.constexpr,
-    INTER: tl.constexpr,
-    SLOTS: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    pair = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    row = pair // SLOTS
-    tl.extra.cuda.gdc_wait()
-    e = tl.load(ids_ptr + pair).to(tl.int64)
-    shared = e < 0
-    n = pid_n * BN + tl.arange(0, BN)
-    k = tl.arange(0, BK)
-    # Routed [w3 (up); w1 (gate)] rows of expert e, or the shared expert's [up; gate] copy.
-    base = tl.where(shared, sw_ptr, w_ptr + tl.maximum(e, 0) * (2 * INTER * H))
-    sbase = tl.where(shared, ss_ptr, s_ptr + tl.maximum(e, 0) * (2 * INTER // 128) * (H // 128))
-    up_row = base + n[:, None] * H
-    gate_row = up_row + INTER * H
-    s_up = sbase + (pid_n * BN // 128) * (H // 128)
-    s_gate = s_up + (INTER // 128) * (H // 128)
-    acc_u = tl.zeros((BN,), tl.float32)
-    acc_g = tl.zeros((BN,), tl.float32)
-    for kb in range(0, H, BK):
-        x = tl.load(x_ptr + row * H + kb + k).to(tl.float32)
-        su = tl.load(s_up + (kb + k) // 128)
-        sg = tl.load(s_gate + (kb + k) // 128)
-        acc_u += tl.sum(
-            tl.load(up_row + kb + k[None, :]).to(tl.float32) * (x * su)[None, :], axis=1
-        )
-        acc_g += tl.sum(
-            tl.load(gate_row + kb + k[None, :]).to(tl.float32) * (x * sg)[None, :], axis=1
-        )
-    # Released after the weight stream: earlier, the dependents' CTAs would occupy SMs this
-    # multi-wave grid still needs.
-    tl.extra.cuda.gdc_launch_dependents()
-    g = tl.minimum(acc_g, limit)
-    u = tl.minimum(tl.maximum(acc_u, -limit), limit)
-    tl.store(act_ptr + pair * INTER + n, g / (1.0 + tl.exp(-g)) * u)
-
-
-@triton.jit
-def _fc2_kernel(
-    act_ptr,
-    ids_ptr,
-    wts_ptr,
-    w_ptr,
-    s_ptr,
-    sw_ptr,
-    ss_ptr,
-    out_ptr,
-    H: tl.constexpr,
-    INTER: tl.constexpr,
-    SLOTS: tl.constexpr,
-    BN: tl.constexpr,
-):
-    row = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    n = pid_n * BN + tl.arange(0, BN)
-    j = tl.arange(0, INTER)
-    acc = tl.zeros((BN,), tl.float32)
-    tl.extra.cuda.gdc_wait()
-    for slot in range(SLOTS):
-        pair = row * SLOTS + slot
-        e = tl.load(ids_ptr + pair).to(tl.int64)
-        shared = e < 0
-        base = tl.where(shared, sw_ptr, w_ptr + tl.maximum(e, 0) * (H * INTER))
-        sbase = tl.where(shared, ss_ptr, s_ptr + tl.maximum(e, 0) * (H // 128) * (INTER // 128))
-        a = tl.load(act_ptr + pair * INTER + j)
-        s = tl.load(sbase + (pid_n * BN // 128) * (INTER // 128) + j // 128)
-        w = tl.load(base + n[:, None] * INTER + j[None, :]).to(tl.float32)
-        acc += tl.sum(w * (a * s)[None, :], axis=1) * tl.load(wts_ptr + pair)
-    tl.extra.cuda.gdc_launch_dependents()
-    tl.store(out_ptr + row * H + n, acc.to(tl.bfloat16))
+# distinct experts of a step at most: every row's eight routed experts and the shared one
+_MAX_DISTINCT = MAX_ROWS * _SLOTS
 
 
 class DecodeMoe(OpWrapper):
-    """``scaling * sum_i w_i * expert_{e_i}(x) + shared(x)`` for each of at most 8 rows.
+    """``scaling * sum_i w_i * expert_{e_i}(x) + shared(x)`` for each of at most 4 rows.
 
     ``logits`` are the router's FP32 ``[M, E]`` outputs; ``bias`` the FP32 correction bias.
     ``w31`` / ``s31`` are the routed experts' ``[E, 2I, H]`` FP8 ``[up; gate]`` weights and
@@ -178,68 +59,40 @@ class DecodeMoe(OpWrapper):
     )
 
     note = """
-    Top-8 ties go to the lower expert index. The FC1 activations stay FP32 between the two
-    launches ([M * 9, I] scratch). Rows beyond 4 are the caller's to route elsewhere: every
-    (row, slot) reads its expert's weights, so as rows start sharing experts the grouped GEMM's
-    one read per expert wins (measured: 8 rows already slower).
+    Top-8 ties go to the lower expert index. The kernels are compiled for H = 4096, I = 512 and
+    E = 288 (moe_tp4) and hold at most 4 rows (the FC1 -> FC2 scratch and the routing tables);
+    larger steps are the caller's to route to the grouped GEMMs. Each distinct expert of the step
+    is read from HBM once, so the time follows the number of distinct experts the rows select
+    (one request's MTP-3 verify rows choose 14-33 of them, shared expert included).
     """
 
     def __call__(self, x, logits, bias, scaling, limit, w31, s31, w2, s2, sw31, ss31, sw2, ss2):
         m, h = x.shape
-        num_experts = logits.shape[1]
         inter = w2.shape[2]
-        ids = torch.empty((m, _SLOTS), dtype=torch.int32, device=x.device)
-        wts = torch.empty((m, _SLOTS), dtype=torch.float32, device=x.device)
-        pdl = get_env_enable_pdl()
-        _topk_kernel[(m,)](
+        dev = x.device
+        actw = torch.empty((_MAX_DISTINCT, 2, MAX_ROWS, inter), dtype=torch.float16, device=dev)
+        route = torch.empty(1 + _MAX_DISTINCT, dtype=torch.int32, device=dev)
+        wtab = torch.empty((_MAX_DISTINCT, MAX_ROWS), dtype=torch.float32, device=dev)
+        out = torch.empty((m, h), dtype=torch.bfloat16, device=dev)
+        ops.decode_moe(
+            x,
             logits,
             bias,
-            ids,
-            wts,
             scaling,
-            num_experts,
-            triton.next_power_of_2(num_experts),
-            _TOPK,
-            _SLOTS,
-            num_warps=4,
-            launch_pdl=pdl,
-        )
-        act = torch.empty((m * _SLOTS, inter), dtype=torch.float32, device=x.device)
-        _fc1_kernel[(m * _SLOTS, inter // 32)](
-            x,
-            ids,
+            limit,
             w31,
             s31,
-            sw31,
-            ss31,
-            act,
-            limit,
-            h,
-            inter,
-            _SLOTS,
-            32,
-            512,
-            num_warps=4,
-            num_stages=3,
-            launch_pdl=pdl,
-        )
-        out = torch.empty((m, h), dtype=torch.bfloat16, device=x.device)
-        _fc2_kernel[(m, h // 32)](
-            act,
-            ids,
-            wts,
             w2,
             s2,
+            sw31,
+            ss31,
             sw2,
             ss2,
+            actw,
+            route,
+            wtab,
             out,
-            h,
-            inter,
-            _SLOTS,
-            32,
-            num_warps=4,
-            num_stages=3,
-            launch_pdl=pdl,
+            get_env_enable_pdl(),
         )
         return out
 
@@ -280,7 +133,9 @@ class DecodeMoe(OpWrapper):
             assert t.dtype == torch.float8_e4m3fn and t.is_contiguous()
         for t in (s31, s2, ss31, ss2):
             assert t.dtype == torch.float32 and t.is_contiguous()
-        assert h % 256 == 0 and w2.shape[2] % 128 == 0
+        assert h == 4096 and logits.shape[1] == 288 and w2.shape[2] == 512, (
+            "the kernels are compiled for H 4096, E 288, I 512"
+        )
 
 
 decode_moe = DecodeMoe()
