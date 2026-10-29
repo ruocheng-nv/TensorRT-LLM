@@ -25,11 +25,6 @@ namespace glm53_fp8
 {
 
 constexpr int kDecodeMoeMaxRows = 4;
-// Scratch the caller provides per call: the FC1 -> FC2 activations as an f16 hi / lo pair
-// [kDecodeMoeMaxDistinct, 2, kDecodeMoeMaxRows, 512], the distinct experts [1 + kDecodeMoeMaxDistinct]
-// (int32: their count, then the expert ids, -1 the shared expert) and the routing weights per distinct
-// expert and row [kDecodeMoeMaxDistinct, kDecodeMoeMaxRows] (fp32).
-constexpr int kDecodeMoeMaxDistinct = kDecodeMoeMaxRows * 9;
 
 struct DecodeMoeArgs
 {
@@ -44,17 +39,16 @@ struct DecodeMoeArgs
     float const* ss31;
     uint8_t const* sw2;
     float const* ss2;
-    void* actw; // scratch, see above
-    int* route;
-    float* wtab;
     void* out; // [M, 4096] bf16
     float scaling;
     float limit;
     int rows;
-    bool pdl; // programmatic dependent launch of both kernels
+    bool pdl; // programmatic dependent launch (only the weights are read before the grid-dependency wait)
 };
 
-// FC1 (persistent, routing included) then FC2 on `stream`.
+// One persistent launch on `stream`: routing, FC1 + SwiGLU, FC2. Its scratch (activations, per-expert completion
+// counts, the unit counter) is device-global and reset by the last CTA of each call, so calls on one device must be
+// stream-ordered.
 cudaError_t decodeMoe(DecodeMoeArgs const& args, cudaStream_t stream);
 
 } // namespace glm53_fp8

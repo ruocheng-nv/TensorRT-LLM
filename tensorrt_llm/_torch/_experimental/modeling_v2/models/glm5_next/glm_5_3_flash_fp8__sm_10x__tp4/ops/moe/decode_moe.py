@@ -1,22 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The MoE branch of a decode step of at most 4 rows in two CUDA launches (after the router GEMM).
+"""The MoE branch of a decode step of at most 4 rows in one persistent CUDA launch (after the router GEMM).
 
-``fc1`` (persistent, one CTA per SM) computes the routing in every CTA (sigmoid scores, FP32
-correction bias, top-8, normalized weights times the routed scaling factor, the shared expert as
-a ninth slot of weight 1) and the distinct experts of the step, then streams each distinct
-expert's up and gate rows once from HBM in 32 KB TMA bulk copies, multiplies them with the BF16
-rows on the tensor cores (e4m3 and BF16 both convert to f16 exactly; FP32 accumulation, each
-128 x 128 block's partial times its scale) and applies the clamped SwiGLU and the routing weight.
-``fc2`` (one CTA per 32 output columns) streams each distinct expert's down-projection tile and
-sums the experts in FP32 before the single BF16 rounding. The rank's result is the moe_tp
-partial the caller all-reduces. The kernels are in ``kernels/csrc/kernels/decode_moe.cu``.
+Every CTA (one per SM) computes the routing itself (sigmoid scores, FP32 correction bias, top-8,
+normalized weights times the routed scaling factor) while its producer warp already streams the
+shared expert, whose weights do not depend on the routing. The distinct experts of the step are
+split into FC1 units (8 up and 8 gate rows of one expert over H, two contiguous 32 KB TMA bulk
+copies) handed out by a global counter; the compute warps multiply them with the BF16 rows on the
+tensor cores (e4m3 and BF16 both convert to f16 exactly; FP32 accumulation, each 128 x 128 block's
+partial times its scale) and an epilogue warp applies the clamped SwiGLU and the routing weight.
+When a CTA's FC1 claims run out it moves to FC2: each pair of CTAs (a 2-CTA cluster) owns 64
+output columns and streams every expert's down-projection tile as soon as that expert's FC1
+activations are complete, so FC2 overlaps the FC1 tail. The two halves are summed over DSMEM in
+a fixed order before the single BF16 rounding. The rank's result is the moe_tp partial the caller
+all-reduces. The kernel is in ``kernels/csrc/kernels/decode_moe.cu``.
 
 The BF16 activations are never quantized: the FC1 -> FC2 activations travel as an f16 hi / lo
 pair, so this computes the reference product more closely than the FP8-activation grouped GEMM
-it replaces at these sizes. Both launches use programmatic dependent launch
-(``TRTLLM_ENABLE_PDL``): ``fc1`` reads the rows and logits only after its grid-dependency wait,
-``fc2`` the activations only after its own.
+it replaces at these sizes. With programmatic dependent launch (``TRTLLM_ENABLE_PDL``) only the
+weights are read before the grid-dependency wait.
 """
 
 from __future__ import annotations
@@ -35,9 +37,6 @@ from ...kernels._lib import ops
 
 MAX_ROWS = 4
 _TOPK = 8
-_SLOTS = _TOPK + 1
-# distinct experts of a step at most: every row's eight routed experts and the shared one
-_MAX_DISTINCT = MAX_ROWS * _SLOTS
 
 
 class DecodeMoe(OpWrapper):
@@ -59,21 +58,16 @@ class DecodeMoe(OpWrapper):
     )
 
     note = """
-    Top-8 ties go to the lower expert index. The kernels are compiled for H = 4096, I = 512 and
-    E = 288 (moe_tp4) and hold at most 4 rows (the FC1 -> FC2 scratch and the routing tables);
-    larger steps are the caller's to route to the grouped GEMMs. Each distinct expert of the step
+    Top-8 ties go to the lower expert index. The kernel is compiled for H = 4096, I = 512 and
+    E = 288 (moe_tp4) and holds at most 4 rows; larger steps are the caller's to route to the
+    grouped GEMMs. Its FC1 -> FC2 scratch and work counters are device-global and reset by the
+    call's last CTA, so calls on one device must be ordered on one stream. Each distinct expert of the step
     is read from HBM once, so the time follows the number of distinct experts the rows select
     (one request's MTP-3 verify rows choose 14-33 of them, shared expert included).
     """
 
     def __call__(self, x, logits, bias, scaling, limit, w31, s31, w2, s2, sw31, ss31, sw2, ss2):
-        m, h = x.shape
-        inter = w2.shape[2]
-        dev = x.device
-        actw = torch.empty((_MAX_DISTINCT, 2, MAX_ROWS, inter), dtype=torch.float16, device=dev)
-        route = torch.empty(1 + _MAX_DISTINCT, dtype=torch.int32, device=dev)
-        wtab = torch.empty((_MAX_DISTINCT, MAX_ROWS), dtype=torch.float32, device=dev)
-        out = torch.empty((m, h), dtype=torch.bfloat16, device=dev)
+        out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
         ops.decode_moe(
             x,
             logits,
@@ -88,9 +82,6 @@ class DecodeMoe(OpWrapper):
             ss31,
             sw2,
             ss2,
-            actw,
-            route,
-            wtab,
             out,
             get_env_enable_pdl(),
         )
@@ -134,7 +125,7 @@ class DecodeMoe(OpWrapper):
         for t in (s31, s2, ss31, ss2):
             assert t.dtype == torch.float32 and t.is_contiguous()
         assert h == 4096 and logits.shape[1] == 288 and w2.shape[2] == 512, (
-            "the kernels are compiled for H 4096, E 288, I 512"
+            "the kernel is compiled for H 4096, E 288, I 512"
         )
 
 

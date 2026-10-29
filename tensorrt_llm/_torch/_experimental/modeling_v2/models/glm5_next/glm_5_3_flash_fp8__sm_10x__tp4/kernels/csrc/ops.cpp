@@ -26,7 +26,7 @@ namespace
 void decodeMoe(torch::Tensor const& x, torch::Tensor const& logits, torch::Tensor const& bias, double scaling,
     double limit, torch::Tensor const& w31, torch::Tensor const& s31, torch::Tensor const& w2, torch::Tensor const& s2,
     torch::Tensor const& sw31, torch::Tensor const& ss31, torch::Tensor const& sw2, torch::Tensor const& ss2,
-    torch::Tensor& actw, torch::Tensor& route, torch::Tensor& wtab, torch::Tensor& out, bool pdl)
+    torch::Tensor& out, bool pdl)
 {
     glm53_fp8::DecodeMoeArgs a{};
     a.x = x.data_ptr();
@@ -40,9 +40,6 @@ void decodeMoe(torch::Tensor const& x, torch::Tensor const& logits, torch::Tenso
     a.ss31 = ss31.data_ptr<float>();
     a.sw2 = static_cast<uint8_t const*>(sw2.data_ptr());
     a.ss2 = ss2.data_ptr<float>();
-    a.actw = actw.data_ptr();
-    a.route = route.data_ptr<int>();
-    a.wtab = wtab.data_ptr<float>();
     a.out = out.data_ptr();
     a.scaling = static_cast<float>(scaling);
     a.limit = static_cast<float>(limit);
@@ -58,5 +55,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("decode_moe", &decodeMoe);
     m.attr("decode_moe_max_rows") = glm53_fp8::kDecodeMoeMaxRows;
-    m.attr("decode_moe_max_distinct") = glm53_fp8::kDecodeMoeMaxDistinct;
 }
