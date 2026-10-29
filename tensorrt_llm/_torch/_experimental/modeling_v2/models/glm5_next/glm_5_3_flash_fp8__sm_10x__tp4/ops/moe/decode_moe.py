@@ -3,17 +3,17 @@
 """The MoE branch of a decode step of at most 4 rows in one persistent CUDA launch (after the router GEMM).
 
 Every CTA (one per SM) computes the routing itself (sigmoid scores, FP32 correction bias, top-8,
-normalized weights times the routed scaling factor) while its producer warp already streams the
-shared expert, whose weights do not depend on the routing. The distinct experts of the step are
-split into FC1 units (8 up and 8 gate rows of one expert over H, two contiguous 32 KB TMA bulk
-copies) handed out by a global counter; the compute warps multiply them with the BF16 rows on the
+normalized weights times the routed scaling factor) and derives the same static schedule from it,
+while its producer warp already streams the shared expert, whose weights do not depend on the
+routing. FC1 tiles (4 up and 4 gate rows of one expert over H, 32 KB) go round robin over the CTAs,
+the CTAs without FC2 rows taking the tail; the compute warps multiply them with the BF16 rows on the
 tensor cores (e4m3 and BF16 both convert to f16 exactly; FP32 accumulation, each 128 x 128 block's
-partial times its scale) and an epilogue warp applies the clamped SwiGLU and the routing weight.
-When a CTA's FC1 claims run out it moves to FC2: each pair of CTAs (a 2-CTA cluster) owns 64
-output columns and streams every expert's down-projection tile as soon as that expert's FC1
-activations are complete, so FC2 overlaps the FC1 tail. The two halves are summed over DSMEM in
-a fixed order before the single BF16 rounding. The rank's result is the moe_tp partial the caller
-all-reduces. The kernel is in ``kernels/csrc/kernels/decode_moe.cu``.
+partial times its scale) and the epilogue warps apply the clamped SwiGLU and the routing weight and
+publish the activation. For FC2, each of 128 CTAs owns 32 output columns and streams every distinct
+expert's down-projection tile, adding the expert's activation once its FC1 tiles are complete, so
+FC2 overlaps the FC1 tail; the experts are summed in a fixed order in FP32 before the single BF16
+rounding. The rank's result is the moe_tp partial the caller all-reduces. The kernel is in
+``kernels/csrc/kernels/decode_moe.cu``.
 
 The BF16 activations are never quantized: the FC1 -> FC2 activations travel as an f16 hi / lo
 pair, so this computes the reference product more closely than the FP8-activation grouped GEMM
@@ -60,8 +60,8 @@ class DecodeMoe(OpWrapper):
     note = """
     Top-8 ties go to the lower expert index. The kernel is compiled for H = 4096, I = 512 and
     E = 288 (moe_tp4) and holds at most 4 rows; larger steps are the caller's to route to the
-    grouped GEMMs. Its FC1 -> FC2 scratch and work counters are device-global and reset by the
-    call's last CTA, so calls on one device must be ordered on one stream. Each distinct expert of the step
+    grouped GEMMs. Its FC1 -> FC2 scratch and counters are device-global (the counters double-buffered
+    by call parity), so calls on one device must be ordered on one stream. Each distinct expert of the step
     is read from HBM once, so the time follows the number of distinct experts the rows select
     (one request's MTP-3 verify rows choose 14-33 of them, shared expert included).
     """

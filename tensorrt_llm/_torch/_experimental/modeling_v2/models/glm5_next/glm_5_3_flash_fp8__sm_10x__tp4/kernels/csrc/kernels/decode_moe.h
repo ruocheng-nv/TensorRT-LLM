@@ -47,7 +47,7 @@ struct DecodeMoeArgs
 };
 
 // One persistent launch on `stream`: routing, FC1 + SwiGLU, FC2. Its scratch (activations, per-expert completion
-// counts, the unit counter) is device-global and reset by the last CTA of each call, so calls on one device must be
+// counters double-buffered by call parity, per-CTA call epochs) is device-global, so calls on one device must be
 // stream-ordered.
 cudaError_t decodeMoe(DecodeMoeArgs const& args, cudaStream_t stream);
 
