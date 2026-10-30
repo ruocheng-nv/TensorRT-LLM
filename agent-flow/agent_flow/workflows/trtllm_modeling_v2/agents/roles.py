@@ -18,12 +18,44 @@ from .session_model import CODEX_SESSION_ENV, ModelSelectionError, session_model
 #: The skills this workflow ships, one directory each; the run materializes them.
 PACKAGED_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
+#: Directories (os.pathsep-separated) of further skills, one directory each, that the operator gives every
+#: role of this run, e.g. the skills of an external tool the roles reach through `extra_mcp_servers`. They are
+#: materialized and loaded like the packaged ones.
+EXTRA_SKILLS_ENV = "MV2FLOW_EXTRA_SKILLS"
+
+#: A text file the operator appends to every role's system prompt: run-wide guidance that is not part of the
+#: spec, e.g. how to use an external tool the roles reach through `extra_mcp_servers`.
+ROLE_BRIEF_ENV = "MV2FLOW_ROLE_BRIEF"
+
+
+def extra_skill_dirs(environ: Mapping[str, str] | None = None) -> tuple[Path, ...]:
+    """The operator's extra skill directories (`MV2FLOW_EXTRA_SKILLS`); each holds a SKILL.md."""
+    env = os.environ if environ is None else environ
+    found: dict[str, Path] = {}
+    for root in filter(None, env.get(EXTRA_SKILLS_ENV, "").split(os.pathsep)):
+        base = Path(root)
+        if not base.is_dir():
+            raise ValueError(f"{EXTRA_SKILLS_ENV}: {root} is not a directory")
+        for skill in sorted(p for p in base.iterdir() if (p / "SKILL.md").is_file()):
+            if skill.name in found or (PACKAGED_SKILLS_DIR / skill.name).exists():
+                raise ValueError(f"{EXTRA_SKILLS_ENV}: skill {skill.name} is given twice")
+            found[skill.name] = skill
+    return tuple(found.values())
+
+
+def role_brief(environ: Mapping[str, str] | None = None) -> str:
+    """The operator's run-wide brief for every role (`MV2FLOW_ROLE_BRIEF`), or empty."""
+    env = os.environ if environ is None else environ
+    path = env.get(ROLE_BRIEF_ENV, "")
+    return Path(path).read_text().strip() if path else ""
+
 
 def packaged_skills() -> tuple[str, ...]:
     """The names of the skills the run materializes: the only ones its roles load."""
-    if not PACKAGED_SKILLS_DIR.is_dir():
-        return ()
-    return tuple(sorted(p.name for p in PACKAGED_SKILLS_DIR.iterdir() if p.is_dir()))
+    names = {p.name for p in extra_skill_dirs()}
+    if PACKAGED_SKILLS_DIR.is_dir():
+        names.update(p.name for p in PACKAGED_SKILLS_DIR.iterdir() if p.is_dir())
+    return tuple(sorted(names))
 
 
 ROLES: tuple[str, ...] = (
@@ -121,10 +153,14 @@ def _model_configured(task_data: Mapping[str, Any], role: str, default_backend: 
 
 __all__ = [
     "CODEX_SESSION_ENV",
+    "EXTRA_SKILLS_ENV",
     "PACKAGED_SKILLS_DIR",
     "ROLES",
+    "ROLE_BRIEF_ENV",
     "driving_backend",
+    "extra_skill_dirs",
     "packaged_skills",
+    "role_brief",
     "resolve_role_agent",
     "resolve_role_agents",
 ]

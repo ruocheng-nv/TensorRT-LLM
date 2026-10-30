@@ -53,7 +53,7 @@ from agent_flow.logger import get_logger
 
 from ..agents import codex_state
 from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
-from ..agents.roles import PACKAGED_SKILLS_DIR, resolve_role_agents
+from ..agents.roles import PACKAGED_SKILLS_DIR, extra_skill_dirs, resolve_role_agents, role_brief
 from ..agents.slots import AgentGate, Priority, turn_priority
 from ..agents.turns import InProcessTurnExecutor, TurnRequest, TurnTimeout
 from ..checks import boot as boot_checks
@@ -304,6 +304,9 @@ class TrtllmModelingV2Workflow:
     ) -> AgentLayer:
         # Every stage uses the same resolved launcher model and explicit task overrides.
         agent = self._role_agents()[name]
+        brief = role_brief()
+        if brief:
+            system_prompt = f"{system_prompt}\n\n{brief}"
         # The role reports by writing its decision file, and the Stop hook
         # refuses a turn that wrote nothing. `Write` is a weak requirement --
         # the role writes other files too -- but the enum is validated when
@@ -526,18 +529,21 @@ class TrtllmModelingV2Workflow:
         )
 
     def _materialize_skills(self) -> Path:
-        """Copy the packaged skills into this run's workspace, where every backend finds them.
+        """Copy the packaged and the operator's extra skills into this run's workspace.
 
         Claude Code reads `.claude/skills`, Codex `.agents/skills`; both are the
-        session's cwd-relative skill directories. Returns the first.
+        session's cwd-relative skill directories, where every backend finds them.
+        Returns the first.
         """
         source = PACKAGED_SKILLS_DIR
+        skills = sorted(p for p in source.iterdir() if p.is_dir()) if source.is_dir() else []
+        skills += extra_skill_dirs()
         destinations = [self.workspace / name for name in SKILL_DIRS]
-        if not source.is_dir():
+        if not skills:
             return destinations[0]
         for destination in destinations:
             destination.mkdir(parents=True, exist_ok=True)
-            for skill_dir in sorted(p for p in source.iterdir() if p.is_dir()):
+            for skill_dir in skills:
                 target = destination / skill_dir.name
                 if _same_tree(skill_dir, target):
                     # A resumed run: the copy is current, and the directory may be read-only
