@@ -544,11 +544,13 @@ def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
 def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     """Every gate's time limit fits in one allocation of the sessions that run the gates.
 
-    The spool admits a job only where it can finish before its allocation ends, so a
-    gate whose limit is longer than a whole allocation is never admitted: it would wait
-    for ever. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
+    The spool admits a job only where its limit plus ``HANDOVER_MARGIN_S`` fits before its
+    allocation ends, so a gate whose limit does not fit in a whole allocation less that
+    margin is never admitted: it would wait for ever. A limit equal to the allocation's is
+    one of those. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
     disaggregated test's ``accuracy.disagg.timeout``.
     """
+    from ...infra.compute.scheduler import HANDOVER_MARGIN_S
     from ...infra.compute.sessions import sessions_from_task
 
     sessions = [
@@ -556,7 +558,7 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     ]
     if not sessions:
         return []
-    budget = int(max(s.time_limit_s for s in sessions))
+    budget = int(max(s.time_limit_s for s in sessions) - HANDOVER_MARGIN_S)
     accuracy = task_data.get("accuracy") or {}
     limits = {
         "accuracy.timeout": int(accuracy.get("timeout") or accuracy_checks.ACCURACY_TIMEOUT_S)
@@ -568,8 +570,9 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     if over:
         raise PreflightError(
             "; ".join(f"{key} is {limit}s" for key, limit in over.items())
-            + f", longer than one gates allocation ({budget}s): the spool never admits a job "
-            f"that cannot finish in its allocation, so it would wait for ever. Set it below "
+            + f", longer than one gates allocation less the {int(HANDOVER_MARGIN_S)}s hand-over "
+            f"margin ({budget}s): the spool never admits a job that cannot finish in its "
+            f"allocation, so it would wait for ever. Set it below "
             f"{budget}s (with room for loading the model), or give the gates sessions a longer "
             "time_limit."
         )

@@ -122,7 +122,11 @@ def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_
     }
     with pytest.raises(preflight.PreflightError, match="accuracy.timeout is 14400s"):
         preflight.check_gate_budgets(task)
+    # As long as the allocation itself: the margin the spool keeps leaves it no room either.
+    task["accuracy"]["timeout"] = 7200
+    with pytest.raises(preflight.PreflightError, match="accuracy.timeout is 7200s"):
+        preflight.check_gate_budgets(task)
     task["accuracy"]["timeout"] = 5400
     (note,) = preflight.check_gate_budgets(task)
-    assert "accuracy.timeout 5400s" in note and "7200s" in note
+    assert "accuracy.timeout 5400s" in note and "7080s" in note
     assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
