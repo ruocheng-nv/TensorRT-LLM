@@ -158,10 +158,16 @@ class RunEnvironment:
             return replace(self, world_size=1).command(argv, single_process=True)
         if self.needs_llmapi_launch:
             argv = self._mpirun_launch(argv)
-        elif single_process:
-            # The process inherits a step's PMI variables: a spool script runs inside the
-            # session's own allocation.
-            argv = self._scrub_and_exec(argv)
+        else:
+            if single_process:
+                # The process inherits a step's PMI variables: a spool script runs inside the
+                # session's own allocation.
+                argv = self._scrub_and_exec(argv)
+            # The build finds its headers through `pip show tensorrt_llm` (NVRTC compiles kernels
+            # at the first decode step), so the pip on PATH must be the measured interpreter's:
+            # its directory goes first, as for a launch, unless the spec states PATH itself.
+            if os.path.isabs(self.python) and "PATH" not in self.env:
+                argv = f'PATH={shlex.quote(os.path.dirname(self.python))}:"$PATH" {argv}'
         prefix = self.prefix
         return f"{prefix} {argv}".strip()
 
