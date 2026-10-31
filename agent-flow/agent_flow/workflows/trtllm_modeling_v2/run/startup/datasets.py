@@ -70,12 +70,22 @@ DATA_SUFFIXES = frozenset({".parquet", ".arrow", ".json", ".jsonl", ".csv"})
 
 
 def _holds_files(path: Path) -> bool:
+    """Whether ``path`` holds a staged dataset: a data file outside .cache, and no download in progress.
+
+    A file still ``*.incomplete`` under .cache is a split not yet there, even beside one that
+    finished: GSM8K's few-shot prompts read the train split as well as the test split.
+    """
     try:
-        return path.is_dir() and any(
-            p.is_file() and p.suffix in DATA_SUFFIXES
-            for p in path.rglob("*")
-            if ".cache" not in p.parts
-        )
+        if not path.is_dir():
+            return False
+        rows = False
+        for p in path.rglob("*"):
+            if ".cache" in p.relative_to(path).parts:
+                if p.name.endswith(".incomplete"):
+                    return False
+            elif p.is_file() and p.suffix in DATA_SUFFIXES:
+                rows = True
+        return rows
     except OSError:
         return False
 
