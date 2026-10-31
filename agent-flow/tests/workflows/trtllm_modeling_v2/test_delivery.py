@@ -154,6 +154,8 @@ def test_an_uncommitted_target_fails_even_though_the_file_is_there(tmp_path):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
 
     git("init", "-q")
+    # A user who hides untracked files from `git status` must not hide them from the check.
+    git("config", "status.showUntrackedFiles", "no")
     (tmp_path / "seed").write_text("s\n", encoding="utf-8")
     git("add", "seed")
     git("-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "seed")

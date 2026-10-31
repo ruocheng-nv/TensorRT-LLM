@@ -579,8 +579,10 @@ def check_tree_committed(repo_root: Path, paths: Sequence[str]) -> list[Check]:
     if not (repo_root / ".git").exists():
         return []
     try:
+        # Untracked files stated explicitly: `status.showUntrackedFiles=no` in the user's
+        # config would hide a target that was never committed.
         result = subprocess.run(
-            ["git", "status", "--porcelain", "--", *paths],
+            ["git", "status", "--porcelain", "--untracked-files=all", "--", *paths],
             cwd=repo_root,
             capture_output=True,
             text=True,
