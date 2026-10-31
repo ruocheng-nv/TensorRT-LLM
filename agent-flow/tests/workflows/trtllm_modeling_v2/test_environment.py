@@ -31,3 +31,32 @@ def test_every_command_scrubs_the_allocations_launcher_environment():
     single = env.command("/p probe.py", single_process=True)
     assert "${!PMIX@}" in single
     assert "exec /p probe.py" in single
+
+
+def test_a_one_rank_command_finds_the_measured_interpreters_pip_first():
+    """The build locates its headers through `pip show tensorrt_llm` when NVRTC compiles at decode.
+
+    A session PATH that leads to another environment's pip fails the first decode step, so a
+    one-rank command puts the interpreter's directory first, as a multi-rank launch does.
+    """
+    env = RunEnvironment(kind="session_spool", python="/w/venv/bin/python", spool="/s")
+    command = env.python_command("-m pytest t.py")
+    assert 'PATH=/w/venv/bin:"$PATH" /w/venv/bin/python -m pytest t.py' in command
+    # Not engine work: still first on PATH, outside the scrub, at any world size.
+    for world_size in (1, 4):
+        single = RunEnvironment(
+            kind="session_spool", python="/w/venv/bin/python", world_size=world_size, spool="/s"
+        ).command("/w/venv/bin/python probe.py", single_process=True)
+        assert 'PATH=/w/venv/bin:"$PATH" bash -c' in single, world_size
+        assert "exec /w/venv/bin/python probe.py" in single, world_size
+    # An interpreter found on PATH has no directory to put first.
+    assert "PATH=" not in RunEnvironment(kind="local", python="python3").command("x.py")
+
+
+def test_a_spec_that_states_path_keeps_it_as_stated():
+    env = RunEnvironment(
+        kind="session_spool", python="/w/venv/bin/python", env={"PATH": "/opt/bin:/usr/bin"}
+    )
+    for command in (env.command("x.py"), env.command("probe.py", single_process=True)):
+        assert "PATH=/opt/bin:/usr/bin" in command
+        assert "/w/venv/bin:" not in command
