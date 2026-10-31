@@ -29,6 +29,25 @@ def test_a_missing_dataset_is_downloaded_into_the_workspace(tmp_path):
     assert asked == [["openai/gsm8k", str(tmp_path / "ws/datasets/openai/gsm8k")]]
 
 
+def test_a_directory_holding_only_the_dataset_card_is_not_staged(tmp_path):
+    # An interrupted download: the card is there, the rows are still incomplete under .cache.
+    target = tmp_path / "ws" / "datasets" / "openai" / "gsm8k"
+    (target / ".cache" / "huggingface" / "download" / "main").mkdir(parents=True)
+    (target / "README.md").write_text("card")
+    (target / "eval.yaml").write_text("task: gsm8k")
+    (target / ".cache/huggingface/download/main/test.parquet.incomplete").write_text("part")
+    asked = []
+
+    def run(argv, **kwargs):
+        asked.append(argv[-1])
+        _files(Path(argv[-1]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    entry = datasets.stage({"accuracy": {}}, tmp_path / "ws", "gsm8k", python="/py", run=run)
+    assert asked == [str(target)]
+    assert entry["state"] == "ready" and entry["source"] == "downloaded openai/gsm8k"
+
+
 def test_the_tree_tests_read_a_models_root_that_holds_the_staged_copy(tmp_path):
     root = tmp_path / "models"
     (root / "stepfun").mkdir(parents=True)

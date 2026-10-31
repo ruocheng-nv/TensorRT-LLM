@@ -64,10 +64,17 @@ def _set(workspace: Path, benchmark: str, **entry: Any) -> None:
     write_text_atomic(Path(workspace) / DIRNAME / STATUS_FILENAME, json.dumps(data, indent=1))
 
 
+#: What a dataset's rows are stored in. A directory holding only its card (README.md, eval.yaml) is not
+#: staged: an interrupted download leaves exactly that, its rows still under .cache as *.incomplete.
+DATA_SUFFIXES = frozenset({".parquet", ".arrow", ".json", ".jsonl", ".csv"})
+
+
 def _holds_files(path: Path) -> bool:
     try:
         return path.is_dir() and any(
-            p.is_file() for p in path.rglob("*") if ".cache" not in p.parts
+            p.is_file() and p.suffix in DATA_SUFFIXES
+            for p in path.rglob("*")
+            if ".cache" not in p.parts
         )
     except OSError:
         return False
