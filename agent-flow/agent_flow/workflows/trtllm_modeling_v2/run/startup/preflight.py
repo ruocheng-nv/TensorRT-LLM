@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
+from ...agents.roles import EXTRA_SKILLS_ENV, ROLE_BRIEF_ENV, extra_skill_dirs, role_brief
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
 from ...checks import check_config, check_runtime
@@ -366,6 +367,30 @@ def check_launch_settings(task_data: Mapping[str, Any]) -> list[str]:
             "so the shared check configuration is ambiguous:\n  "
             + "\n  ".join(problems)
             + "\nState each setting once, in either place: it reaches every launcher."
+        )
+    return notes
+
+
+def check_operator_inputs(environ: Mapping[str, str] | None = None) -> list[str]:
+    """The operator's extra skills and role brief, when set, are what their variables say.
+
+    The run reads both again when it materializes its skills and builds its
+    prompts; a bad value is refused here, before the host is touched, rather
+    than as a traceback after the first turns. Returns notes.
+    """
+    try:
+        skills = extra_skill_dirs(environ)
+        brief = role_brief(environ)
+    except ValueError as exc:
+        raise PreflightError(str(exc)) from exc
+    notes: list[str] = []
+    if skills:
+        names = ", ".join(skill.name for skill in skills)
+        notes.append(f"{EXTRA_SKILLS_ENV}: every role also gets the operator's skills {names}")
+    if brief:
+        notes.append(
+            f"{ROLE_BRIEF_ENV}: every role's system prompt ends with the operator's brief "
+            f"({len(brief)} characters)"
         )
     return notes
 
@@ -991,6 +1016,7 @@ def run_preflight(
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
     notes.extend(check_kv_cache_configs(task_data, checkpoint_config))
+    notes.extend(check_operator_inputs())
 
     env_block = dict(task_data.get("environment") or {})
     declared_env = {str(k): str(v) for k, v in (env_block.get("env") or {}).items()}

@@ -24,7 +24,7 @@ from agent_flow.console import print_message, print_rule
 from agent_flow.prompts import dump_prompt_bundle
 
 from ...agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
-from ...agents.roles import packaged_skills
+from ...agents.roles import packaged_skills, role_brief
 from ...agents.turns import TURNS_DIRNAME
 from ...checks import check_config, gate_cli
 from ...infra.compute.environment import (
@@ -248,6 +248,8 @@ def _run_preflight(
             scope=str(workflow.task_data.get("scope") or "full"),
             commit_policy=CommitPolicy.from_task(workflow.task_data, workspace=workflow.workspace),
             notes=str(workflow.task_data.get("notes") or ""),
+            # Read once, here: the dumped bundle and every turn's record show it.
+            brief=role_brief(),
         )
     # What every role is told, verbatim and per launch.
     dump_prompt_bundle(workflow.prompts, workflow.workspace / PROMPTS_DIRNAME)

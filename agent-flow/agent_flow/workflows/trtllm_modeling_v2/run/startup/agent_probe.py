@@ -38,7 +38,7 @@ from agent_flow.agent_runtime import AgentConfig
 from agent_flow.backends.claude_code import CLI_PATH_ENV, cli_stderr_to, launched_cli
 
 from ...agents import codex_state
-from ...agents.roles import CODEX_SESSION_ENV, ROLES, resolve_role_agents
+from ...agents.roles import CODEX_SESSION_ENV, ROLES, extra_skill_dirs, resolve_role_agents
 from ...agents.turns import InProcessTurnExecutor, TurnRequest
 
 #: Where the probe's turns and files live, under the workspace.
@@ -140,7 +140,9 @@ def probe_inputs(
     - ``process``: this host, whether this process runs inside another
       agent's session, and the home and configuration directories the CLIs
       authenticate from (the run's own Codex home, ``codex_home``);
-    - ``checkout``: the checkout whose ``HEAD`` the probe reads, by path.
+    - ``checkout``: the checkout whose ``HEAD`` the probe reads, by path;
+    - ``extra_skills``: the operator's extra skills, by path, when there are
+      any: the probe judges which loaded skills are not the run's own.
     """
     env = os.environ if environ is None else environ
     claude = any(probed.agent.backend == "claude-code" for probed in agents)
@@ -156,6 +158,10 @@ def probe_inputs(
         },
         "checkout": task_data.get("trtllm_repo_path"),
     }
+    # Only when set, so a pass recorded before the variable existed still stands.
+    extra = extra_skill_dirs(env)
+    if extra:
+        parts["extra_skills"] = [str(path) for path in extra]
     return part_digests(parts)
 
 

@@ -7,7 +7,14 @@ from __future__ import annotations
 
 import pytest
 
+from agent_flow.logger import get_logger
 from agent_flow.workflows.trtllm_modeling_v2.agents import roles
+from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import (
+    PROMPTS_DIRNAME,
+    build_trtllm_modeling_v2_prompts,
+)
+from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import Inventory
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
 
 from .test_workflow import _workflow
 
@@ -98,12 +105,53 @@ def test_an_extra_skill_named_like_another_is_refused(tmp_path, monkeypatch):
         roles.extra_skill_dirs()
 
 
-def test_the_operators_brief_reaches_every_role(tmp_path, monkeypatch):
+def test_an_extra_skills_path_that_gives_no_skill_is_refused(tmp_path, monkeypatch):
+    """A skill named directly, or a directory holding none, would give the roles nothing silently."""
+    _skill(tmp_path / "extra", "tool")
+    monkeypatch.setenv(roles.EXTRA_SKILLS_ENV, str(tmp_path / "extra" / "tool"))
+    with pytest.raises(ValueError, match="pass its parent directory"):
+        roles.extra_skill_dirs()
+    (tmp_path / "empty" / "notes").mkdir(parents=True)
+    monkeypatch.setenv(roles.EXTRA_SKILLS_ENV, str(tmp_path / "empty"))
+    with pytest.raises(ValueError, match="holds no skill"):
+        roles.extra_skill_dirs()
+
+
+def test_a_brief_that_is_missing_or_empty_is_refused(tmp_path, monkeypatch):
+    assert roles.role_brief() == ""
+    monkeypatch.setenv(roles.ROLE_BRIEF_ENV, str(tmp_path / "missing.txt"))
+    with pytest.raises(ValueError, match="cannot read"):
+        roles.role_brief()
+    (tmp_path / "blank.txt").write_text("\n  \n")
+    monkeypatch.setenv(roles.ROLE_BRIEF_ENV, str(tmp_path / "blank.txt"))
+    with pytest.raises(ValueError, match="is empty"):
+        roles.role_brief()
+
+
+def test_the_operators_brief_reaches_every_role_through_the_prompt_bundle(tmp_path, monkeypatch):
+    """The bundle is what is dumped and what each turn records: the brief must be in it."""
+    bundle = build_trtllm_modeling_v2_prompts(notes="Mind the cache.", brief="Use the tool.")
+    for role in roles.ROLES:
+        prompt = getattr(bundle, role)
+        assert prompt.endswith("\n\nUse the tool."), role
+        assert prompt.count("Use the tool.") == 1, role
+    # A layer's system prompt is its bundle entry as given: the brief is not added twice.
+    brief = tmp_path / "brief.txt"
+    brief.write_text("Use the tool.\n")
+    monkeypatch.setenv(roles.ROLE_BRIEF_ENV, str(brief))
     workflow = _workflow(tmp_path)
     assert workflow._make_agent("planner", "system").config.system_prompt == "system"
+
+
+def test_preflight_dumps_the_brief_in_every_roles_prompt(tmp_path, task_file, monkeypatch):
     brief = tmp_path / "brief.txt"
     brief.write_text("Use the tool when it helps.\n")
     monkeypatch.setenv(roles.ROLE_BRIEF_ENV, str(brief))
+    monkeypatch.setattr(bootstrap, "run_inventory_probe", lambda *a, **k: Inventory())
+    workflow = _workflow(tmp_path)
+    log = get_logger().console
+    assert bootstrap._run_preflight(workflow, workflow._init_state(task_file, log), log)
     for role in roles.ROLES:
-        prompt = workflow._make_agent(role, "system").config.system_prompt
-        assert prompt == "system\n\nUse the tool when it helps."
+        prompt = getattr(workflow.prompts, role)
+        assert prompt.count("\n\nUse the tool when it helps.") == 1, role
+        assert (workflow.workspace / PROMPTS_DIRNAME / f"{role}.md").read_text() == prompt, role

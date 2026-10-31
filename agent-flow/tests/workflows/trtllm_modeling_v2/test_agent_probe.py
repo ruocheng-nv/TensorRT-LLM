@@ -59,3 +59,18 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     assert not (tmp_path / "ws" / AGENT_PROBE_RECORD).exists()
     # Nothing past it ran: not the substrate gate, not the survey.
     assert shells == []
+
+
+def test_a_pass_stands_only_for_the_operators_extra_skills_it_saw(tmp_path):
+    """Which loaded skills are the run's own depends on them: a resume with others probes again."""
+    (tmp_path / "extra" / "tool").mkdir(parents=True)
+    (tmp_path / "extra" / "tool" / "SKILL.md").write_text("---\nname: tool\n---\n")
+    agents = agent_probe.distinct_agents({})
+    plain = agent_probe.probe_inputs({}, agents, environ={})
+    extra = agent_probe.probe_inputs(
+        {}, agents, environ={"MV2FLOW_EXTRA_SKILLS": str(tmp_path / "extra")}
+    )
+    assert "extra_skills" not in plain
+    assert {name for name in {*plain, *extra} if plain.get(name) != extra.get(name)} == {
+        "extra_skills"
+    }

@@ -130,3 +130,26 @@ def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_
     (note,) = preflight.check_gate_budgets(task)
     assert "accuracy.timeout 5400s" in note and "7080s" in note
     assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
+
+
+def test_the_operators_skills_and_brief_are_refused_at_preflight_when_they_give_nothing(tmp_path):
+    """A wrong path is a clear refusal before the host is touched, not a traceback mid-run."""
+    skills, brief = "MV2FLOW_EXTRA_SKILLS", "MV2FLOW_ROLE_BRIEF"
+    (tmp_path / "skills" / "tool").mkdir(parents=True)
+    (tmp_path / "skills" / "tool" / "SKILL.md").write_text("---\nname: tool\n---\n")
+    (tmp_path / "brief.txt").write_text("Use the tool.\n")
+    (tmp_path / "blank.txt").write_text("")
+    for environ, said in (
+        ({skills: str(tmp_path / "nowhere")}, "is not a directory"),
+        ({skills: str(tmp_path / "skills" / "tool")}, "pass its parent directory"),
+        ({skills: str(tmp_path)}, "holds no skill"),
+        ({brief: str(tmp_path / "missing.txt")}, "cannot read"),
+        ({brief: str(tmp_path / "blank.txt")}, "is empty"),
+    ):
+        with pytest.raises(PreflightError, match=said):
+            preflight.check_operator_inputs(environ)
+    assert preflight.check_operator_inputs({}) == []
+    notes = preflight.check_operator_inputs(
+        {skills: str(tmp_path / "skills"), brief: str(tmp_path / "brief.txt")}
+    )
+    assert len(notes) == 2 and "tool" in notes[0] and "13 characters" in notes[1]

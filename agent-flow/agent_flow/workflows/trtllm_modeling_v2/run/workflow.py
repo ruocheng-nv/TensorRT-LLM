@@ -53,7 +53,7 @@ from agent_flow.logger import get_logger
 
 from ..agents import codex_state
 from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
-from ..agents.roles import PACKAGED_SKILLS_DIR, extra_skill_dirs, resolve_role_agents, role_brief
+from ..agents.roles import PACKAGED_SKILLS_DIR, extra_skill_dirs, resolve_role_agents
 from ..agents.slots import AgentGate, Priority, turn_priority
 from ..agents.turns import InProcessTurnExecutor, TurnRequest, TurnTimeout
 from ..checks import boot as boot_checks
@@ -304,9 +304,6 @@ class TrtllmModelingV2Workflow:
     ) -> AgentLayer:
         # Every stage uses the same resolved launcher model and explicit task overrides.
         agent = self._role_agents()[name]
-        brief = role_brief()
-        if brief:
-            system_prompt = f"{system_prompt}\n\n{brief}"
         # The role reports by writing its decision file, and the Stop hook
         # refuses a turn that wrote nothing. `Write` is a weak requirement --
         # the role writes other files too -- but the enum is validated when

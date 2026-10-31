@@ -103,18 +103,21 @@ def build_trtllm_modeling_v2_prompts(
     scope: str = "full",
     commit_policy: "CommitPolicy | None" = None,
     notes: str = "",
+    brief: str = "",
 ) -> PromptBundle:
     """Build the prompt bundle for one run.
 
     ``environment`` is the resolved launch environment from preflight;
     ``source_embargo``, ``scope`` and ``notes`` come from ``task.yaml``.
     ``commit_policy`` is the run's commit rules; the two committing roles
-    are told them.
+    are told them. ``brief`` is the operator's run-wide brief
+    (``MV2FLOW_ROLE_BRIEF``), given to every role verbatim.
     """
     prompts = DEFAULT_PROMPTS
     prompts = _for_every_role(prompts, scope_block(scope))
     prompts = _for_every_role(prompts, source_embargo_block(tuple(source_embargo)))
     prompts = _for_every_role(prompts, notes_block(notes))
+    prompts = _for_every_role(prompts, brief)
     if commit_policy is not None:
         block = commit_instruction(commit_policy)
         prompts = prompts.with_extensions(kernel_writer=block, assembler=block)

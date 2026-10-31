@@ -29,14 +29,27 @@ ROLE_BRIEF_ENV = "MV2FLOW_ROLE_BRIEF"
 
 
 def extra_skill_dirs(environ: Mapping[str, str] | None = None) -> tuple[Path, ...]:
-    """The operator's extra skill directories (`MV2FLOW_EXTRA_SKILLS`); each holds a SKILL.md."""
+    """The operator's extra skill directories (`MV2FLOW_EXTRA_SKILLS`); each holds a SKILL.md.
+
+    Raises ``ValueError`` for a path that is not a directory of skills: a skill itself, or a
+    directory holding none, would otherwise give the roles nothing without a word.
+    """
     env = os.environ if environ is None else environ
     found: dict[str, Path] = {}
     for root in filter(None, env.get(EXTRA_SKILLS_ENV, "").split(os.pathsep)):
         base = Path(root)
         if not base.is_dir():
             raise ValueError(f"{EXTRA_SKILLS_ENV}: {root} is not a directory")
-        for skill in sorted(p for p in base.iterdir() if (p / "SKILL.md").is_file()):
+        if (base / "SKILL.md").is_file():
+            raise ValueError(
+                f"{EXTRA_SKILLS_ENV}: {root} is a skill itself; pass its parent directory"
+            )
+        skills = sorted(p for p in base.iterdir() if (p / "SKILL.md").is_file())
+        if not skills:
+            raise ValueError(
+                f"{EXTRA_SKILLS_ENV}: {root} holds no skill (a directory with a SKILL.md)"
+            )
+        for skill in skills:
             if skill.name in found or (PACKAGED_SKILLS_DIR / skill.name).exists():
                 raise ValueError(f"{EXTRA_SKILLS_ENV}: skill {skill.name} is given twice")
             found[skill.name] = skill
@@ -44,10 +57,21 @@ def extra_skill_dirs(environ: Mapping[str, str] | None = None) -> tuple[Path, ..
 
 
 def role_brief(environ: Mapping[str, str] | None = None) -> str:
-    """The operator's run-wide brief for every role (`MV2FLOW_ROLE_BRIEF`), or empty."""
+    """The operator's run-wide brief for every role (`MV2FLOW_ROLE_BRIEF`), or empty when unset.
+
+    Raises ``ValueError`` when it names no readable file, or an empty one.
+    """
     env = os.environ if environ is None else environ
     path = env.get(ROLE_BRIEF_ENV, "")
-    return Path(path).read_text().strip() if path else ""
+    if not path:
+        return ""
+    try:
+        brief = Path(path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"{ROLE_BRIEF_ENV}: cannot read {path}: {exc.strerror or exc}") from exc
+    if not brief:
+        raise ValueError(f"{ROLE_BRIEF_ENV}: {path} is empty")
+    return brief
 
 
 def packaged_skills() -> tuple[str, ...]:
